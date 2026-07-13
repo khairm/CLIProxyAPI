@@ -4,6 +4,7 @@
 package util
 
 import (
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -189,27 +190,23 @@ func HideAPIKey(apiKey string) string {
 	return apiKey
 }
 
-// maskAuthorizationHeader masks the Authorization header value while preserving the auth type prefix.
-// Common formats: "Bearer <token>", "Basic <credentials>", "ApiKey <key>", etc.
-// It preserves the prefix (e.g., "Bearer ") and only masks the token/credential part.
+const fullyRedactedHeaderValue = "[REDACTED]"
+
+// MaskAuthorizationHeader fully redacts an Authorization header value.
 //
 // Parameters:
 //   - value: The Authorization header value
 //
 // Returns:
-//   - string: The masked Authorization value with prefix preserved
+//   - string: A fixed redaction marker
 func MaskAuthorizationHeader(value string) string {
-	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
-	if len(parts) < 2 {
-		return HideAPIKey(value)
-	}
-	return parts[0] + " " + HideAPIKey(parts[1])
+	return fullyRedactedHeaderValue
 }
 
 // MaskSensitiveHeaderValue masks sensitive header values while preserving expected formats.
 //
 // Behavior by header key (case-insensitive):
-//   - "Authorization": Preserve the auth type prefix (e.g., "Bearer ") and mask only the credential part.
+//   - Authorization-bearing headers, "X-Edgee-API-Key", and "X-Edgee-Session-Id": Fully redact the value.
 //   - Headers containing "api-key": Mask the entire value using HideAPIKey.
 //   - Others: Return the original value unchanged.
 //
@@ -222,8 +219,10 @@ func MaskAuthorizationHeader(value string) string {
 func MaskSensitiveHeaderValue(key, value string) string {
 	lowerKey := strings.ToLower(strings.TrimSpace(key))
 	switch {
-	case strings.Contains(lowerKey, "authorization"):
-		return MaskAuthorizationHeader(value)
+	case strings.Contains(lowerKey, "authorization"),
+		lowerKey == "x-edgee-api-key",
+		lowerKey == "x-edgee-session-id":
+		return fullyRedactedHeaderValue
 	case strings.Contains(lowerKey, "api-key"),
 		strings.Contains(lowerKey, "apikey"),
 		strings.Contains(lowerKey, "token"),
@@ -232,6 +231,16 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	default:
 		return value
 	}
+}
+
+// MaskSensitiveHeaderValueWithFullRedaction fully redacts the named headers and
+// otherwise applies the standard sensitive-header masking rules.
+func MaskSensitiveHeaderValueWithFullRedaction(key, value string, fullyRedactedHeaders map[string]struct{}) string {
+	canonicalKey := http.CanonicalHeaderKey(strings.TrimSpace(key))
+	if _, fullyRedact := fullyRedactedHeaders[canonicalKey]; fullyRedact {
+		return fullyRedactedHeaderValue
+	}
+	return MaskSensitiveHeaderValue(key, value)
 }
 
 // MaskSensitiveQuery masks sensitive query parameters, e.g. auth_token, within the raw query string.

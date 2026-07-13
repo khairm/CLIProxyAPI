@@ -2,16 +2,47 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+type codexOAuthRouteSelectionExecutor struct {
+	provider string
+	calls    []string
+}
+
+func (e *codexOAuthRouteSelectionExecutor) Identifier() string { return e.provider }
+
+func (e *codexOAuthRouteSelectionExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls = append(e.calls, auth.ID)
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e *codexOAuthRouteSelectionExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *codexOAuthRouteSelectionExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *codexOAuthRouteSelectionExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *codexOAuthRouteSelectionExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
 func TestManagerExecuteCodexOAuthRouteUnauthorizedDoesNotRefreshSharedCredential(t *testing.T) {
 	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+	m.SetConfig(&internalconfig.Config{CodexOAuthBaseURL: "https://edge.example.test/codex"})
 	ctx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "9ea20258-9c30-4e64-a68d-84e08bceb90c")
 
 	resp, errExecute := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
@@ -144,8 +175,11 @@ func TestManagerMarkResultStockFailureStillMarksSharedCredentialHealth(t *testin
 	}
 }
 
-func TestManagerCodexOAuthRouteDoesNotIsolateCodexAPIKeyCredential(t *testing.T) {
+func TestManagerCodexOAuthRouteRejectsCodexAPIKeyCredential(t *testing.T) {
 	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{CodexOAuthBaseURL: "https://edge.example.test/codex"})
+	executor := &codexOAuthRouteSelectionExecutor{provider: "codex"}
+	m.RegisterExecutor(executor)
 	auth := &Auth{
 		ID:         "codex-api-key-health",
 		Provider:   "codex",
@@ -157,20 +191,76 @@ func TestManagerCodexOAuthRouteDoesNotIsolateCodexAPIKeyCredential(t *testing.T)
 	}
 
 	ctx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "")
-	errMark := m.MarkResultWithError(ctx, Result{
-		AuthID:   auth.ID,
-		Provider: auth.Provider,
-		Model:    "gpt-5",
-		Success:  false,
-		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
-	})
-	if errMark != nil {
-		t.Fatalf("MarkResult error = %v", errMark)
+	_, errExecute := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5"}, cliproxyexecutor.Options{})
+	assertCodexOAuthRouteUnavailable(t, errExecute)
+	if len(executor.calls) != 0 {
+		t.Fatalf("Execute calls = %v, want no upstream execution", executor.calls)
 	}
 
 	updated, ok := m.GetByID(auth.ID)
-	if !ok || updated.Failed != 1 || updated.Status != StatusError || updated.ModelStates["gpt-5"] == nil {
-		t.Fatalf("Codex API-key health = %+v, want normal failure classification", updated)
+	if !ok || updated == nil {
+		t.Fatal("Codex API-key auth missing after route rejection")
+	}
+	assertCodexOAuthRouteDidNotChangeAuthHealth(t, updated, "gpt-5", auth.Status)
+}
+
+func TestManagerCodexOAuthRouteRejectsNonCodexProvider(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	ctx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "")
+
+	_, errExecute := m.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "claude-sonnet-4"}, cliproxyexecutor.Options{})
+	assertCodexOAuthRouteUnavailable(t, errExecute)
+}
+
+func TestManagerCodexOAuthRouteSelectsOAuthFromMixedCredentialPool(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{CodexOAuthBaseURL: "https://edge.example.test/codex"})
+	executor := &codexOAuthRouteSelectionExecutor{provider: "codex"}
+	m.RegisterExecutor(executor)
+	auths := []*Auth{
+		{
+			ID:         "codex-api-key",
+			Provider:   "codex",
+			Status:     StatusActive,
+			Attributes: map[string]string{AttributeAPIKey: "upstream-api-key"},
+		},
+		{
+			ID:       "codex-oauth",
+			Provider: "codex",
+			Status:   StatusActive,
+			Metadata: map[string]any{"access_token": "oauth-access-token"},
+		},
+	}
+	for _, auth := range auths {
+		if _, errRegister := m.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+
+	ctx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "")
+	resp, errExecute := m.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != "codex-oauth" {
+		t.Fatalf("Execute() payload = %q, want OAuth credential ID", got)
+	}
+	if len(executor.calls) != 1 || executor.calls[0] != "codex-oauth" {
+		t.Fatalf("Execute calls = %v, want only Codex OAuth credential", executor.calls)
+	}
+}
+
+func assertCodexOAuthRouteUnavailable(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want route_unavailable")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "route_unavailable" || authErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want route_unavailable HTTP %d", authErr, http.StatusServiceUnavailable)
 	}
 }
 

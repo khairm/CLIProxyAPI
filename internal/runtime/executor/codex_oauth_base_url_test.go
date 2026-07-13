@@ -1,13 +1,11 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"strings"
 	"sync"
 	"testing"
@@ -251,7 +249,7 @@ func TestCodexExecutorOAuthHeadersAreNotAppliedWithoutBaseURL(t *testing.T) {
 	}
 }
 
-func TestCodexExecutorConfiguredOAuthBaseDoesNotOverrideAPIKeyAuth(t *testing.T) {
+func TestCodexExecutorConfiguredOAuthBaseRejectsAPIKeyAuth(t *testing.T) {
 	exec := NewCodexExecutor(&config.Config{
 		CodexOAuthBaseURL: "https://edge.example.com/codex",
 		CodexOAuthHeaders: map[string]string{"x-edgee-api-key": "edge-key"},
@@ -261,64 +259,23 @@ func TestCodexExecutorConfiguredOAuthBaseDoesNotOverrideAPIKeyAuth(t *testing.T)
 		"base_url": "https://api-key.example.com/v1",
 	}}
 	routeCtx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "")
-	_, baseURL := exec.codexCreds(routeCtx, auth)
-	if baseURL != "https://api-key.example.com/v1" {
-		t.Fatalf("baseURL = %q, want API-key route", baseURL)
-	}
-	req, errRequest := http.NewRequestWithContext(routeCtx, http.MethodPost, baseURL+"/responses", nil)
+	req, errRequest := http.NewRequestWithContext(routeCtx, http.MethodPost, "https://api-key.example.com/v1/responses", nil)
 	if errRequest != nil {
 		t.Fatalf("NewRequest() error = %v", errRequest)
 	}
-	exec.applyCodexOAuthHeaders(req, auth)
-	if got := req.Header.Get("X-Edgee-Api-Key"); got != "" {
-		t.Fatalf("X-Edgee-Api-Key = %q, want empty for API-key auth", got)
+	errPrepare := exec.PrepareRequest(req, auth)
+	if errPrepare == nil {
+		t.Fatal("PrepareRequest() error = nil, want route_unavailable")
 	}
-}
-
-func TestCodexExecutorOrdinaryBearerWireMatchesStock(t *testing.T) {
-	t.Parallel()
-
-	auth := &cliproxyauth.Auth{
-		Provider: "codex",
-		Metadata: map[string]any{
-			"access_token": "oauth-token",
-			"account_id":   "account-1",
-		},
+	statusErr, okStatus := errPrepare.(interface{ StatusCode() int })
+	if !okStatus || statusErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("PrepareRequest() error = %v, want HTTP %d", errPrepare, http.StatusServiceUnavailable)
 	}
-	sessionID := "065e0091-7f30-4f0b-a0ed-3e45e2bb1124"
-	capture := func(cfg *config.Config) []byte {
-		t.Helper()
-		var dump []byte
-		rt := codexOAuthRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			var errDump error
-			dump, errDump = httputil.DumpRequestOut(req, true)
-			if errDump != nil {
-				return nil, fmt.Errorf("dump outbound request: %w", errDump)
-			}
-			return codexOAuthCompletedResponse(req), nil
-		})
-		ctx := codexOAuthExecutionContext("ordinary-key", "ordinary-wire", false, sessionID, rt)
-		if errExecute := executeCodexOAuthTestRequest(ctx, NewCodexExecutor(cfg), auth); errExecute != nil {
-			t.Fatalf("Execute() error = %v", errExecute)
-		}
-		return dump
+	if !strings.Contains(errPrepare.Error(), "route_unavailable") || !strings.Contains(errPrepare.Error(), "API-key") {
+		t.Fatalf("PrepareRequest() error = %q, want route_unavailable API-key detail", errPrepare)
 	}
-
-	stockWire := capture(&config.Config{
-		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
-	})
-	overrideConfiguredWire := capture(&config.Config{
-		CodexOAuthBaseURL:      "https://edge.example.test/codex",
-		CodexOAuthHeaders:      map[string]string{"x-edgee-api-key": "edge-key"},
-		CodexOAuthRouteAPIKeys: []string{"route-key"},
-		SDKConfig:              config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
-	})
-
-	if !bytes.Equal(stockWire, overrideConfiguredWire) {
-		t.Fatalf("ordinary bearer wire differs from stock\nstock:\n%s\noverride configured:\n%s", stockWire, overrideConfiguredWire)
-	}
-	if bytes.Contains(overrideConfiguredWire, []byte("X-Edgee-Api-Key")) || bytes.Contains(overrideConfiguredWire, []byte("X-Edgee-Session-Id")) {
-		t.Fatalf("ordinary bearer wire contains override-only headers:\n%s", overrideConfiguredWire)
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want no credential injection after rejection", got)
 	}
 }
 

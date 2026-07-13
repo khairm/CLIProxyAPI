@@ -1684,6 +1684,13 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 		}
 	}
+	var loadedAuths []*coreauth.Auth
+	if s.coreManager != nil {
+		loadedAuths = s.coreManager.List()
+	}
+	if errRoutePool := validateCodexOAuthRouteCredentialPool(s.cfg, loadedAuths); errRoutePool != nil {
+		return errRoutePool
+	}
 
 	if !homeEnabled {
 		tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
@@ -1853,6 +1860,24 @@ func validateCodexOAuthBaseURLAuthConflicts(cfg *config.Config, auths []*coreaut
 		return fmt.Errorf("codex-oauth-base-url conflicts with Codex OAuth auth %q base_url %q", codexAuthConflictName(auth), baseURL)
 	}
 	return nil
+}
+
+func validateCodexOAuthRouteCredentialPool(cfg *config.Config, auths []*coreauth.Auth) error {
+	if cfg == nil || len(cfg.CodexOAuthRouteAPIKeys) == 0 {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+		if auth.Attributes != nil && strings.TrimSpace(auth.Attributes[coreauth.AttributeAPIKey]) != "" {
+			continue
+		}
+		if auth.AuthKind() == coreauth.AuthKindOAuth {
+			return nil
+		}
+	}
+	return fmt.Errorf("codex-oauth-route-api-keys requires at least one Codex OAuth credential in the loaded auth store")
 }
 
 func codexAuthConflictName(auth *coreauth.Auth) string {

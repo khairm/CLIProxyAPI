@@ -264,6 +264,9 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+
+	postResultPersistenceMu       sync.Mutex
+	postResultPersistenceFailures []error
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -1634,6 +1637,11 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); routed {
+		// The manager's global scheduler also contains API-key credentials. Fall
+		// back to the caller's already-filtered candidate list for routed requests.
+		return nil, false, nil
+	}
 	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
 }
 
@@ -1824,14 +1832,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		if !failed {
 			if errMark := m.MarkResultWithError(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true}); errMark != nil {
-				if ctx == nil {
-					out <- cliproxyexecutor.StreamChunk{Err: errMark}
-				} else {
-					select {
-					case <-ctx.Done():
-					case out <- cliproxyexecutor.StreamChunk{Err: errMark}:
-					}
-				}
+				m.deferPostResultPersistenceFailure(ctx, errMark)
 			}
 		}
 	}()
@@ -2362,12 +2363,69 @@ func (m *Manager) Load(ctx context.Context) error {
 	return nil
 }
 
+type postResultPersistenceError struct {
+	cause error
+}
+
+func (e *postResultPersistenceError) Error() string {
+	if e == nil || e.cause == nil {
+		return "persistence_unavailable: auth state persistence failed after a previous successful upstream request"
+	}
+	return fmt.Sprintf("persistence_unavailable: auth state persistence failed after a previous successful upstream request: %v", e.cause)
+}
+
+func (e *postResultPersistenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *postResultPersistenceError) StatusCode() int {
+	return http.StatusServiceUnavailable
+}
+
+func (m *Manager) deferPostResultPersistenceFailure(ctx context.Context, err error) {
+	if m == nil || err == nil {
+		return
+	}
+	deferred := &postResultPersistenceError{cause: err}
+	m.postResultPersistenceMu.Lock()
+	m.postResultPersistenceFailures = append(m.postResultPersistenceFailures, deferred)
+	m.postResultPersistenceMu.Unlock()
+	logEntryWithRequestID(ctx).WithError(err).Error("auth state persistence failed after successful upstream response; the next request will fail before upstream execution")
+}
+
+func (m *Manager) takePostResultPersistenceFailure() error {
+	if m == nil {
+		return nil
+	}
+	m.postResultPersistenceMu.Lock()
+	defer m.postResultPersistenceMu.Unlock()
+	if len(m.postResultPersistenceFailures) == 0 {
+		return nil
+	}
+	err := m.postResultPersistenceFailures[0]
+	m.postResultPersistenceFailures[0] = nil
+	m.postResultPersistenceFailures = m.postResultPersistenceFailures[1:]
+	return err
+}
+
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	if errRoute := validateCodexOAuthRouteProviders(ctx, normalized); errRoute != nil {
+		return cliproxyexecutor.Response{}, errRoute
+	}
+	if errRoute := m.validateCodexOAuthRouteConfiguration(ctx); errRoute != nil {
+		return cliproxyexecutor.Response{}, errRoute
+	}
+	if errPersist := m.takePostResultPersistenceFailure(); errPersist != nil {
+		return cliproxyexecutor.Response{}, errPersist
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -2407,6 +2465,15 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if errRoute := validateCodexOAuthRouteProviders(ctx, normalized); errRoute != nil {
+		return cliproxyexecutor.Response{}, errRoute
+	}
+	if errRoute := m.validateCodexOAuthRouteConfiguration(ctx); errRoute != nil {
+		return cliproxyexecutor.Response{}, errRoute
+	}
+	if errPersist := m.takePostResultPersistenceFailure(); errPersist != nil {
+		return cliproxyexecutor.Response{}, errPersist
+	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -2438,6 +2505,15 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	if errRoute := validateCodexOAuthRouteProviders(ctx, normalized); errRoute != nil {
+		return nil, errRoute
+	}
+	if errRoute := m.validateCodexOAuthRouteConfiguration(ctx); errRoute != nil {
+		return nil, errRoute
+	}
+	if errPersist := m.takePostResultPersistenceFailure(); errPersist != nil {
+		return nil, errPersist
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
@@ -2677,7 +2753,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			if errMark := m.MarkResultWithError(execCtx, result); errMark != nil {
-				return cliproxyexecutor.Response{}, errMark
+				m.deferPostResultPersistenceFailure(execCtx, errMark)
 			}
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
@@ -2806,7 +2882,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			if errMark := m.MarkResultWithError(execCtx, result); errMark != nil {
-				return cliproxyexecutor.Response{}, errMark
+				m.deferPostResultPersistenceFailure(execCtx, errMark)
 			}
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
@@ -4773,11 +4849,54 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 }
 
+func codexOAuthRouteUnavailable(message string) *Error {
+	return &Error{
+		Code:       "route_unavailable",
+		Message:    message,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
+func isCodexOAuthRouteCredential(auth *Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes[AttributeAPIKey]) != "" {
+		return false
+	}
+	return auth.AuthKind() == AuthKindOAuth
+}
+
+func validateCodexOAuthRouteProviders(ctx context.Context, providers []string) error {
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); !routed {
+		return nil
+	}
+	if len(providers) != 1 || !strings.EqualFold(strings.TrimSpace(providers[0]), "codex") {
+		return codexOAuthRouteUnavailable("Codex OAuth override route requires the Codex provider")
+	}
+	return nil
+}
+
+func (m *Manager) validateCodexOAuthRouteConfiguration(ctx context.Context) error {
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); !routed {
+		return nil
+	}
+	if m == nil {
+		return codexOAuthRouteUnavailable("Codex OAuth override route is not configured")
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || strings.TrimSpace(cfg.CodexOAuthBaseURL) == "" {
+		return codexOAuthRouteUnavailable("codex-oauth-base-url is not configured")
+	}
+	return nil
+}
+
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
+	_, codexOAuthRouted := cliproxyexecutor.CodexOAuthRoute(ctx)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 
@@ -4810,6 +4929,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
+		if codexOAuthRouted && !isCodexOAuthRouteCredential(candidate) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -4836,6 +4958,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if codexOAuthRouted {
+			return nil, nil, "", codexOAuthRouteUnavailable("no Codex OAuth credential is available for the configured override route")
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
@@ -4877,6 +5002,18 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if errRoute := validateCodexOAuthRouteProviders(ctx, providers); errRoute != nil {
+		return nil, nil, "", errRoute
+	}
+	if errRoute := m.validateCodexOAuthRouteConfiguration(ctx); errRoute != nil {
+		return nil, nil, "", errRoute
+	}
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); routed {
+		if m.HomeEnabled() {
+			return nil, nil, "", codexOAuthRouteUnavailable("Codex OAuth override route is unavailable in Home mode")
+		}
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
@@ -5497,7 +5634,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				continue
 			}
 			if errMark := m.MarkResultWithError(creditsCtx, result); errMark != nil {
-				return cliproxyexecutor.Response{}, false, errMark
+				m.deferPostResultPersistenceFailure(creditsCtx, errMark)
 			}
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, true, nil

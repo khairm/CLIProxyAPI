@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -71,13 +72,14 @@ func TestLoadConfigCodexOAuthBaseURL(t *testing.T) {
 
 func TestLoadConfigCodexOAuthHeaders(t *testing.T) {
 	tests := []struct {
-		name      string
-		header    string
-		wantValue string
-		wantErr   bool
+		name          string
+		header        string
+		value         string
+		wantCanonical string
+		wantErr       bool
 	}{
-		{name: "valid", header: "x-edgee-api-key", wantValue: "edge-key"},
-		{name: "all token punctuation", header: "!#$%&'*+-.^_`|~", wantValue: "edge-key"},
+		{name: "valid and canonicalized", header: "x-edgee-api-key", value: "edge-key", wantCanonical: "X-Edgee-Api-Key"},
+		{name: "all token punctuation", header: "!#$%&'*+-.^_`|~", value: "edge-key", wantCanonical: "!#$%&'*+-.^_`|~"},
 		{name: "space", header: "x bad", wantErr: true},
 		{name: "colon", header: "x:bad", wantErr: true},
 		{name: "at sign", header: "x@bad", wantErr: true},
@@ -85,14 +87,28 @@ func TestLoadConfigCodexOAuthHeaders(t *testing.T) {
 		{name: "authorization", header: "Authorization", wantErr: true},
 		{name: "host", header: "HOST", wantErr: true},
 		{name: "content length", header: "content-length", wantErr: true},
+		{name: "connection", header: "Connection", wantErr: true},
+		{name: "keep alive", header: "keep-alive", wantErr: true},
+		{name: "te", header: "TE", wantErr: true},
+		{name: "trailer", header: "Trailer", wantErr: true},
+		{name: "transfer encoding", header: "Transfer-Encoding", wantErr: true},
+		{name: "upgrade", header: "Upgrade", wantErr: true},
+		{name: "proxy authorization", header: "Proxy-Authorization", wantErr: true},
+		{name: "arbitrary proxy header", header: "Proxy-Whatever", wantErr: true},
 		{name: "edgee session ID", header: "X-Edgee-Session-Id", wantErr: true},
+		{name: "empty value", header: "X-Edgee-Api-Key", value: "", wantErr: true},
+		{name: "whitespace value", header: "X-Edgee-Api-Key", value: " \t ", wantErr: true},
+		{name: "line feed value", header: "X-Edgee-Api-Key", value: "edge\nkey", wantErr: true},
+		{name: "carriage return value", header: "X-Edgee-Api-Key", value: "edge\rkey", wantErr: true},
+		{name: "tab value", header: "X-Edgee-Api-Key", value: "edge\tkey", wantErr: true},
+		{name: "delete value", header: "X-Edgee-Api-Key", value: "edge\x7fkey", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			configPath := filepath.Join(t.TempDir(), "config.yaml")
 			contents := "codex-oauth-base-url: https://api.edgee.ai/v1\n" +
-				"codex-oauth-headers:\n  " + strconv.Quote(tt.header) + ": edge-key\n"
+				"codex-oauth-headers:\n  " + strconv.Quote(tt.header) + ": " + strconv.Quote(tt.value) + "\n"
 			if errWrite := os.WriteFile(configPath, []byte(contents), 0o600); errWrite != nil {
 				t.Fatalf("write config: %v", errWrite)
 			}
@@ -110,10 +126,65 @@ func TestLoadConfigCodexOAuthHeaders(t *testing.T) {
 			if errLoad != nil {
 				t.Fatalf("LoadConfig() error = %v", errLoad)
 			}
-			if cfg.CodexOAuthHeaders[tt.header] != tt.wantValue {
-				t.Fatalf("CodexOAuthHeaders[%q] = %q, want %q", tt.header, cfg.CodexOAuthHeaders[tt.header], tt.wantValue)
+			if cfg.CodexOAuthHeaders[tt.wantCanonical] != tt.value {
+				t.Fatalf("CodexOAuthHeaders[%q] = %q, want %q; all headers: %#v", tt.wantCanonical, cfg.CodexOAuthHeaders[tt.wantCanonical], tt.value, cfg.CodexOAuthHeaders)
+			}
+			if tt.header != tt.wantCanonical {
+				if _, exists := cfg.CodexOAuthHeaders[tt.header]; exists {
+					t.Fatalf("CodexOAuthHeaders retains non-canonical key %q: %#v", tt.header, cfg.CodexOAuthHeaders)
+				}
 			}
 		})
+	}
+}
+
+func TestValidateCodexOAuthHeadersRejectsInvalidUTF8Value(t *testing.T) {
+	cfg := &Config{
+		CodexOAuthBaseURL: "https://api.edgee.ai/v1",
+		CodexOAuthHeaders: map[string]string{"X-Edgee-Api-Key": string([]byte{0xff})},
+	}
+
+	err := cfg.ValidateCodexOAuthHeaders()
+	if err == nil || !strings.Contains(err.Error(), "control characters") {
+		t.Fatalf("ValidateCodexOAuthHeaders() error = %v, want invalid value error", err)
+	}
+}
+
+func TestLoadConfigCodexOAuthHeadersRejectsCaseInsensitiveDuplicatesDeterministically(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "codex-oauth-base-url: https://api.edgee.ai/v1\n" +
+		"codex-oauth-headers:\n  X-Trace-Secret: first-secret\n  x-trace-secret: second-secret\n"
+	if errWrite := os.WriteFile(configPath, []byte(contents), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+
+	const want = `codex-oauth-headers: duplicate header names "X-Trace-Secret" and "x-trace-secret"`
+	for attempt := 0; attempt < 100; attempt++ {
+		_, errLoad := LoadConfig(configPath)
+		if errLoad == nil || errLoad.Error() != want {
+			t.Fatalf("LoadConfig() attempt %d error = %v, want %q", attempt, errLoad, want)
+		}
+	}
+}
+
+func TestValidateCodexOAuthHeadersCanonicalizesNamesOnce(t *testing.T) {
+	cfg := &Config{
+		CodexOAuthBaseURL: "https://api.edgee.ai/v1",
+		CodexOAuthHeaders: map[string]string{"x-custom-edgee-secret": "secret-value"},
+	}
+
+	if err := cfg.ValidateCodexOAuthHeaders(); err != nil {
+		t.Fatalf("first validation error: %v", err)
+	}
+	wantName := http.CanonicalHeaderKey("x-custom-edgee-secret")
+	if got := cfg.CodexOAuthHeaders[wantName]; got != "secret-value" {
+		t.Fatalf("canonical header value = %q, want %q; headers: %#v", got, "secret-value", cfg.CodexOAuthHeaders)
+	}
+	if err := cfg.ValidateCodexOAuthHeaders(); err != nil {
+		t.Fatalf("second validation error: %v", err)
+	}
+	if got := cfg.CodexOAuthHeaders[wantName]; got != "secret-value" {
+		t.Fatalf("header changed after second validation: %q", got)
 	}
 }
 
@@ -204,7 +275,7 @@ func TestParseConfigBytesValidatesCodexOAuthConfig(t *testing.T) {
 	if cfg.CodexOAuthBaseURL != "https://edge.example.com/codex" {
 		t.Fatalf("CodexOAuthBaseURL = %q, want trimmed URL", cfg.CodexOAuthBaseURL)
 	}
-	if cfg.CodexOAuthHeaders["x-edgee-api-key"] != "edge-key" {
+	if cfg.CodexOAuthHeaders["X-Edgee-Api-Key"] != "edge-key" {
 		t.Fatalf("CodexOAuthHeaders = %#v, want configured header", cfg.CodexOAuthHeaders)
 	}
 
