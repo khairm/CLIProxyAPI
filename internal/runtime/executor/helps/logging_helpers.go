@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -86,7 +87,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 		builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
 	}
 	builder.WriteString("\nHeaders:\n")
-	writeHeaders(builder, info.Headers)
+	writeRequestHeaders(builder, info.Headers, routedCodexOAuthHeaders(ctx, cfg))
 	builder.WriteString("\nBody:\n")
 
 	requestText := ""
@@ -155,7 +156,7 @@ func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 	if !attempt.headersWritten {
 		builder := &strings.Builder{}
 		builder.WriteString("Headers:\n")
-		writeHeaders(builder, headers)
+		writeRequestHeaders(builder, headers, routedCodexOAuthHeaders(ctx, cfg))
 		writeAttemptResponse(ginCtx, attempt, []byte(builder.String()))
 		attempt.headersWritten = true
 		writeAttemptResponse(ginCtx, attempt, []byte("\n"))
@@ -253,7 +254,7 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 		builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
 	}
 	builder.WriteString("Headers:\n")
-	writeHeaders(builder, info.Headers)
+	writeRequestHeaders(builder, info.Headers, routedCodexOAuthHeaders(ctx, cfg))
 	builder.WriteString("\nBody:\n")
 	if len(info.Body) > 0 {
 		builder.Write(info.Body)
@@ -283,7 +284,7 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 		builder.WriteString(fmt.Sprintf("Status: %d\n", status))
 	}
 	builder.WriteString("Headers:\n")
-	writeHeaders(builder, headers)
+	writeRequestHeaders(builder, headers, routedCodexOAuthHeaders(ctx, cfg))
 	builder.WriteString("\n")
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
@@ -558,6 +559,10 @@ func markAPIResponseTimestamp(ginCtx *gin.Context) {
 }
 
 func writeHeaders(builder *strings.Builder, headers http.Header) {
+	writeRequestHeaders(builder, headers, nil)
+}
+
+func writeRequestHeaders(builder *strings.Builder, headers http.Header, fullyRedactedHeaders map[string]struct{}) {
 	if builder == nil {
 		return
 	}
@@ -577,10 +582,29 @@ func writeHeaders(builder *strings.Builder, headers http.Header) {
 			continue
 		}
 		for _, value := range values {
-			masked := util.MaskSensitiveHeaderValue(key, value)
+			masked := util.MaskSensitiveHeaderValueWithFullRedaction(key, value, fullyRedactedHeaders)
 			builder.WriteString(fmt.Sprintf("%s: %s\n", key, masked))
 		}
 	}
+}
+
+func routedCodexOAuthHeaders(ctx context.Context, cfg *config.Config) map[string]struct{} {
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); !routed {
+		return nil
+	}
+
+	redacted := map[string]struct{}{
+		"Authorization":      {},
+		"X-Edgee-Api-Key":    {},
+		"X-Edgee-Session-Id": {},
+	}
+	if cfg == nil {
+		return redacted
+	}
+	for name := range cfg.CodexOAuthHeaders {
+		redacted[http.CanonicalHeaderKey(name)] = struct{}{}
+	}
+	return redacted
 }
 
 func formatAuthInfo(info UpstreamRequestLog) string {

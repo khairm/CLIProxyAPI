@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -401,6 +402,227 @@ func TestManagerUpdatePersistenceFailurePreservesInheritedModelState(t *testing.
 	state := stored.ModelStates["gpt-5"]
 	if !ok || state == nil || !state.Unavailable || !state.NextRetryAfter.Equal(wantRetry) {
 		t.Fatalf("in-memory model state changed after persistence failure: %+v", state)
+	}
+}
+
+type successfulPersistenceExecutor struct {
+	executeCalls atomic.Int32
+	countCalls   atomic.Int32
+	streamCalls  atomic.Int32
+}
+
+func (e *successfulPersistenceExecutor) Identifier() string { return "codex" }
+
+func (e *successfulPersistenceExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.executeCalls.Add(1)
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *successfulPersistenceExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.streamCalls.Add(1)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("event-one")}
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("event-two")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *successfulPersistenceExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	return nil, errors.New("unexpected refresh")
+}
+
+func (e *successfulPersistenceExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.countCalls.Add(1)
+	return cliproxyexecutor.Response{Payload: []byte(`{"tokens":17}`)}, nil
+}
+
+func (e *successfulPersistenceExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected HTTP request")
+}
+
+func (e *successfulPersistenceExecutor) calls(operation string) int32 {
+	switch operation {
+	case "execute":
+		return e.executeCalls.Load()
+	case "count":
+		return e.countCalls.Load()
+	case "stream":
+		return e.streamCalls.Load()
+	default:
+		panic("unknown persistence test operation: " + operation)
+	}
+}
+
+func newSuccessfulPersistenceManager(t *testing.T, store Store, suffix string) (*Manager, *successfulPersistenceExecutor, *Auth, string) {
+	t.Helper()
+
+	model := "persistence-model-" + suffix
+	auth := &Auth{
+		ID:       "persistence-auth-" + suffix,
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":         "codex",
+			"access_token": "test-access-token",
+		},
+	}
+	executor := &successfulPersistenceExecutor{}
+	m := NewManager(store, nil, nil)
+	m.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, errRegister := m.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	return m, executor, auth, model
+}
+
+func executeSuccessfulPersistenceOperation(ctx context.Context, m *Manager, operation, model string) ([]byte, error) {
+	req := cliproxyexecutor.Request{Model: model}
+	switch operation {
+	case "execute":
+		resp, errExecute := m.Execute(ctx, []string{"codex"}, req, cliproxyexecutor.Options{})
+		return resp.Payload, errExecute
+	case "count":
+		resp, errCount := m.ExecuteCount(ctx, []string{"codex"}, req, cliproxyexecutor.Options{})
+		return resp.Payload, errCount
+	case "stream":
+		stream, errStream := m.ExecuteStream(ctx, []string{"codex"}, req, cliproxyexecutor.Options{Stream: true})
+		if errStream != nil {
+			return nil, errStream
+		}
+		var payload []byte
+		for chunk := range stream.Chunks {
+			if chunk.Err != nil {
+				return payload, chunk.Err
+			}
+			payload = append(payload, chunk.Payload...)
+		}
+		return payload, nil
+	default:
+		panic("unknown persistence test operation: " + operation)
+	}
+}
+
+func TestManagerSuccessfulResponseDefersPostResultPersistenceFailure(t *testing.T) {
+	operations := []string{"execute", "count", "stream"}
+	storeFailures := []struct {
+		name      string
+		committed bool
+	}{
+		{name: "save-failed"},
+		{name: "database-committed-mirror-failed", committed: true},
+	}
+
+	for _, operation := range operations {
+		operation := operation
+		for _, storeFailure := range storeFailures {
+			storeFailure := storeFailure
+			t.Run(operation+"/"+storeFailure.name, func(t *testing.T) {
+				cause := errors.New(storeFailure.name)
+				storeErr := error(cause)
+				if storeFailure.committed {
+					storeErr = &committedStoreError{err: cause}
+				}
+				store := &errorStore{err: storeErr}
+				m, executor, auth, model := newSuccessfulPersistenceManager(t, store, operation+"-"+storeFailure.name)
+
+				payload, errFirst := executeSuccessfulPersistenceOperation(context.Background(), m, operation, model)
+				if errFirst != nil {
+					t.Fatalf("first %s error = %v, want successful upstream response", operation, errFirst)
+				}
+				if len(payload) == 0 {
+					t.Fatalf("first %s payload is empty", operation)
+				}
+				if got := executor.calls(operation); got != 1 {
+					t.Fatalf("first %s upstream calls = %d, want 1", operation, got)
+				}
+				if got := store.saveCount.Load(); got != 1 {
+					t.Fatalf("first %s Save calls = %d, want 1", operation, got)
+				}
+
+				stored, ok := m.GetByID(auth.ID)
+				if !ok || stored == nil {
+					t.Fatal("auth missing after successful response")
+				}
+				wantSuccess := int64(0)
+				if storeFailure.committed {
+					wantSuccess = 1
+				}
+				if stored.Success != wantSuccess {
+					t.Fatalf("stored Success = %d, want %d", stored.Success, wantSuccess)
+				}
+
+				_, errNext := executeSuccessfulPersistenceOperation(context.Background(), m, operation, model)
+				if !errors.Is(errNext, cause) {
+					t.Fatalf("next %s error = %v, want deferred persistence cause", operation, errNext)
+				}
+				var statusErr interface{ StatusCode() int }
+				if !errors.As(errNext, &statusErr) || statusErr.StatusCode() != http.StatusServiceUnavailable {
+					t.Fatalf("next %s error status = %v, want %d", operation, errNext, http.StatusServiceUnavailable)
+				}
+				if got := executor.calls(operation); got != 1 {
+					t.Fatalf("next %s upstream calls = %d, want no additional call", operation, got)
+				}
+				if got := store.saveCount.Load(); got != 1 {
+					t.Fatalf("next %s Save calls = %d, want no additional save", operation, got)
+				}
+			})
+		}
+	}
+}
+
+func TestManagerRoutedSuccessfulResponseDoesNotPersistOrEmitTerminalError(t *testing.T) {
+	for _, operation := range []string{"execute", "count", "stream"} {
+		operation := operation
+		t.Run(operation, func(t *testing.T) {
+			cause := errors.New("database committed but local mirror failed")
+			store := &errorStore{err: &committedStoreError{err: cause}}
+			m, executor, _, model := newSuccessfulPersistenceManager(t, store, "routed-"+operation)
+			m.SetConfig(&internalconfig.Config{CodexOAuthBaseURL: "https://codex-route.example"})
+			ctx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "route-session")
+
+			for request := 1; request <= 2; request++ {
+				payload, errExecute := executeSuccessfulPersistenceOperation(ctx, m, operation, model)
+				if errExecute != nil {
+					t.Fatalf("routed %s request %d error = %v", operation, request, errExecute)
+				}
+				if len(payload) == 0 {
+					t.Fatalf("routed %s request %d payload is empty", operation, request)
+				}
+			}
+			if got := executor.calls(operation); got != 2 {
+				t.Fatalf("routed %s upstream calls = %d, want 2", operation, got)
+			}
+			if got := store.saveCount.Load(); got != 0 {
+				t.Fatalf("routed %s Save calls = %d, want 0 shared-health persistence calls", operation, got)
+			}
+		})
+	}
+}
+
+func TestManagerInvalidRoutedRequestDoesNotConsumeDeferredPersistenceFailure(t *testing.T) {
+	cause := errors.New("store save failed")
+	store := &errorStore{err: cause}
+	m, executor, _, model := newSuccessfulPersistenceManager(t, store, "route-validation-order")
+
+	if _, errExecute := executeSuccessfulPersistenceOperation(context.Background(), m, "execute", model); errExecute != nil {
+		t.Fatalf("first Execute() error = %v, want successful upstream response", errExecute)
+	}
+	routedCtx := cliproxyexecutor.WithCodexOAuthRoute(context.Background(), "route-session")
+	_, errRoute := m.Execute(routedCtx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	var authErr *Error
+	if !errors.As(errRoute, &authErr) || authErr.Code != "route_unavailable" {
+		t.Fatalf("invalid routed request error = %v, want route_unavailable", errRoute)
+	}
+
+	_, errNext := executeSuccessfulPersistenceOperation(context.Background(), m, "execute", model)
+	if !errors.Is(errNext, cause) {
+		t.Fatalf("next valid request error = %v, want deferred persistence failure", errNext)
+	}
+	if got := executor.calls("execute"); got != 1 {
+		t.Fatalf("upstream Execute calls = %d, want 1", got)
 	}
 }
 

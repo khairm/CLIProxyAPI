@@ -10,7 +10,7 @@ RUN go mod download
 
 COPY . .
 
-ARG VERSION=7.2.62+edgee.2
+ARG VERSION=7.2.62+edgee.3
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 

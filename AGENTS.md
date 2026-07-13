@@ -20,7 +20,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Default config: `config.yaml` (template: `config.example.yaml`)
 - `.env` is auto-loaded from the working directory
 - Auth material defaults under `auths/`
-- `codex-oauth-base-url`, `codex-oauth-headers`, and `codex-oauth-route-api-keys` are startup-only and opt selected inbound API keys into Codex subscription OAuth routing
+- `codex-oauth-base-url`, `codex-oauth-headers`, and `codex-oauth-route-api-keys` are startup-only and opt selected inbound API keys into Codex subscription OAuth routing; route keys require a loaded Codex OAuth credential and must never fall back to API-key or non-Codex credentials
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
 ## Architecture

@@ -1975,12 +1975,34 @@ func (e *CodexExecutor) usesConfiguredOAuthBaseURL(ctx context.Context, a *clipr
 	return a.Attributes == nil || strings.TrimSpace(a.Attributes["api_key"]) == ""
 }
 
+func (e *CodexExecutor) validateCodexOAuthRouteCredential(ctx context.Context, auth *cliproxyauth.Auth) error {
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); !routed {
+		return nil
+	}
+	if e == nil || strings.TrimSpace(e.codexOAuthBaseURL) == "" {
+		return statusErr{code: http.StatusServiceUnavailable, msg: "route_unavailable: codex-oauth-base-url is not configured"}
+	}
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return statusErr{code: http.StatusServiceUnavailable, msg: "route_unavailable: Codex OAuth override route requires a Codex OAuth credential"}
+	}
+	if auth.Attributes != nil && strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeAPIKey]) != "" {
+		return statusErr{code: http.StatusServiceUnavailable, msg: "route_unavailable: Codex API-key credentials cannot use the Codex OAuth override route"}
+	}
+	if auth.AuthKind() != cliproxyauth.AuthKindOAuth {
+		return statusErr{code: http.StatusServiceUnavailable, msg: "route_unavailable: Codex OAuth override route requires a Codex OAuth credential"}
+	}
+	return nil
+}
+
 func (e *CodexExecutor) routeCodexOAuthHTTPRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
 		return nil
 	}
-	if !e.usesConfiguredOAuthBaseURL(req.Context(), auth) {
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(req.Context()); !routed {
 		return nil
+	}
+	if errCredential := e.validateCodexOAuthRouteCredential(req.Context(), auth); errCredential != nil {
+		return errCredential
 	}
 	if req.URL == nil {
 		return fmt.Errorf("codex executor: request URL is nil")

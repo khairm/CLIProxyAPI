@@ -9,10 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
@@ -886,15 +890,45 @@ func (cfg *Config) ValidateCodexOAuthHeaders() error {
 		return fmt.Errorf("codex-oauth-headers: codex-oauth-base-url must be set")
 	}
 
+	names := make([]string, 0, len(cfg.CodexOAuthHeaders))
 	for name := range cfg.CodexOAuthHeaders {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	canonicalHeaders := make(map[string]string, len(cfg.CodexOAuthHeaders))
+	originalNames := make(map[string]string, len(cfg.CodexOAuthHeaders))
+	for _, name := range names {
 		if !isHTTPToken(name) {
 			return fmt.Errorf("codex-oauth-headers: invalid header name %q", name)
 		}
-		switch strings.ToLower(name) {
-		case "authorization", "host", "content-length", "x-edgee-session-id":
+
+		canonicalName := http.CanonicalHeaderKey(name)
+		lowerName := strings.ToLower(canonicalName)
+		if previousName, duplicate := originalNames[lowerName]; duplicate {
+			return fmt.Errorf("codex-oauth-headers: duplicate header names %q and %q", previousName, name)
+		}
+		originalNames[lowerName] = name
+
+		switch lowerName {
+		case "authorization", "host", "content-length", "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "x-edgee-session-id":
 			return fmt.Errorf("codex-oauth-headers: forbidden header %q", name)
 		}
+		if strings.HasPrefix(lowerName, "proxy-") {
+			return fmt.Errorf("codex-oauth-headers: forbidden header %q", name)
+		}
+
+		value := cfg.CodexOAuthHeaders[name]
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("codex-oauth-headers: header %q value must not be empty", name)
+		}
+		if !utf8.ValidString(value) || strings.ContainsFunc(value, unicode.IsControl) {
+			return fmt.Errorf("codex-oauth-headers: header %q value must be valid UTF-8 and must not contain control characters", name)
+		}
+
+		canonicalHeaders[canonicalName] = value
 	}
+	cfg.CodexOAuthHeaders = canonicalHeaders
 	return nil
 }
 

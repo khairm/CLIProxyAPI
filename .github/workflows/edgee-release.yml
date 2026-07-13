@@ -9,7 +9,45 @@ permissions:
   contents: write
 
 jobs:
+  test-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.0"
+          cache: false
+      - name: Build all packages
+        run: go build ./...
+      - name: Run feature test suites
+        run: |
+          set -euo pipefail
+          go test \
+            ./cmd/server \
+            ./internal/config \
+            ./internal/logging \
+            ./internal/runtime/executor \
+            ./internal/runtime/executor/helps \
+            ./internal/util \
+            ./sdk/api/handlers \
+            ./sdk/cliproxy \
+            ./sdk/cliproxy/auth
+          go test ./internal/api -run '^TestCodexOAuthRoute' -count=1
+      - name: Race-test concurrency and route isolation
+        run: >-
+          go test -race -count=1
+          -run 'Test.*(Concurrent|Concurrency|Isolation|MixedRoutes|RequestScoped)'
+          ./internal/api
+          ./internal/api/handlers/management
+          ./internal/runtime/executor
+          ./sdk/cliproxy/auth
+
   build-windows-arm64:
+    needs: test-gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

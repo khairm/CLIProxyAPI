@@ -76,6 +76,70 @@ func TestValidateCodexOAuthBaseURLAuthConflicts(t *testing.T) {
 	}
 }
 
+func TestValidateCodexOAuthRouteCredentialPool(t *testing.T) {
+	routeConfig := &config.Config{CodexOAuthRouteAPIKeys: []string{"route-key"}}
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		auths   []*coreauth.Auth
+		wantErr bool
+	}{
+		{
+			name: "route keys unset",
+			cfg:  &config.Config{},
+		},
+		{
+			name:    "route keys with empty pool",
+			cfg:     routeConfig,
+			wantErr: true,
+		},
+		{
+			name: "route keys with Codex API key only",
+			cfg:  routeConfig,
+			auths: []*coreauth.Auth{{
+				Provider:   "codex",
+				Attributes: map[string]string{coreauth.AttributeAPIKey: "upstream-key"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "route keys with non-Codex OAuth only",
+			cfg:  routeConfig,
+			auths: []*coreauth.Auth{{
+				Provider: "claude",
+				Metadata: map[string]any{"access_token": "oauth-token"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "route keys with Codex OAuth",
+			cfg:  routeConfig,
+			auths: []*coreauth.Auth{{
+				Provider: "codex",
+				Metadata: map[string]any{"access_token": "oauth-token"},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errValidate := validateCodexOAuthRouteCredentialPool(tt.cfg, tt.auths)
+			if !tt.wantErr {
+				if errValidate != nil {
+					t.Fatalf("validation error = %v, want nil", errValidate)
+				}
+				return
+			}
+			if errValidate == nil {
+				t.Fatal("validation error = nil, want missing Codex OAuth credential error")
+			}
+			if !strings.Contains(errValidate.Error(), "codex-oauth-route-api-keys") || !strings.Contains(errValidate.Error(), "Codex OAuth credential") {
+				t.Fatalf("validation error = %q, want route key and Codex OAuth credential detail", errValidate)
+			}
+		})
+	}
+}
+
 func TestApplyConfigUpdateKeepsStartupCodexOAuthConfig(t *testing.T) {
 	startupURL := "https://startup.example.com/codex"
 	startupHeaders := map[string]string{"x-edgee-api-key": "startup-key"}
@@ -106,10 +170,10 @@ func TestApplyConfigUpdateKeepsStartupCodexOAuthConfig(t *testing.T) {
 	if service.cfg.CodexOAuthBaseURL != startupURL {
 		t.Fatalf("service CodexOAuthBaseURL = %q, want startup %q", service.cfg.CodexOAuthBaseURL, startupURL)
 	}
-	if got := reloaded.CodexOAuthHeaders["x-edgee-api-key"]; got != "startup-key" {
+	if got := reloaded.CodexOAuthHeaders["X-Edgee-Api-Key"]; got != "startup-key" {
 		t.Fatalf("reloaded CodexOAuthHeaders value = %q, want startup value", got)
 	}
-	if got := service.cfg.CodexOAuthHeaders["x-edgee-api-key"]; got != "startup-key" {
+	if got := service.cfg.CodexOAuthHeaders["X-Edgee-Api-Key"]; got != "startup-key" {
 		t.Fatalf("service CodexOAuthHeaders value = %q, want startup value", got)
 	}
 	if got := reloaded.CodexOAuthRouteAPIKeys; len(got) != 1 || got[0] != "startup-route-key" {
@@ -120,7 +184,7 @@ func TestApplyConfigUpdateKeepsStartupCodexOAuthConfig(t *testing.T) {
 	}
 	startupHeaders["x-edgee-api-key"] = "mutated-after-reload"
 	startupRouteAPIKeys[0] = "mutated-after-reload"
-	if got := reloaded.CodexOAuthHeaders["x-edgee-api-key"]; got != "startup-key" {
+	if got := reloaded.CodexOAuthHeaders["X-Edgee-Api-Key"]; got != "startup-key" {
 		t.Fatalf("reloaded CodexOAuthHeaders aliases startup snapshot: got %q", got)
 	}
 	if got := reloaded.CodexOAuthRouteAPIKeys[0]; got != "startup-route-key" {

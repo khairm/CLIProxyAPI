@@ -1,0 +1,125 @@
+{
+  "stock_tag": "v7.2.62",
+  "stock_commit": "3554b63721aac9b4202bf2ef88ba7a82b4e5caf8",
+  "fixtures": [
+    {
+      "name": "responses_post",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "responses-post"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "ok"
+    },
+    {
+      "name": "sse_stream_request",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "sse-stream"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "ok"
+    },
+    {
+      "name": "count_tokens",
+      "method": "",
+      "url": "",
+      "headers": {},
+      "body": "",
+      "outcome": "local:{\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}"
+    },
+    {
+      "name": "query_bearing_url",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses?include=usage\u0026cursor=abc",
+      "headers": {
+        "authorization": [
+          "Bearer oauth-token"
+        ]
+      },
+      "body": "{\"query\":\"kept\"}",
+      "outcome": "status:204"
+    },
+    {
+      "name": "upstream_error",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "upstream-error"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "error:{\"error\":{\"message\":\"fixture rate limit\",\"type\":\"rate_limit_error\"}}"
+    }
+  ]
+}
