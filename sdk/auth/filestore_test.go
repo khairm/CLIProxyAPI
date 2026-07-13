@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -84,6 +85,40 @@ func TestExtractAccessToken(t *testing.T) {
 				t.Errorf("extractAccessToken() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestFileTokenStoreSaveReloadedCodexAuthReplacesFile(t *testing.T) {
+	baseDir := t.TempDir()
+	path := filepath.Join(baseDir, "codex.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"old"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, errList := store.List(context.Background())
+	if errList != nil || len(auths) != 1 {
+		t.Fatalf("List() = %#v, %v; want one auth", auths, errList)
+	}
+	if auths[0].Storage != nil {
+		t.Fatal("reloaded auth unexpectedly retained token storage")
+	}
+	auths[0].Metadata["access_token"] = "new"
+	if _, errSave := store.Save(context.Background(), auths[0]); errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read updated auth: %v", errRead)
+	}
+	if !strings.Contains(string(raw), `"access_token":"new"`) {
+		t.Fatalf("updated auth = %s, want new access token", raw)
+	}
+	matches, errGlob := filepath.Glob(filepath.Join(baseDir, ".codex.json.tmp-*"))
+	if errGlob != nil || len(matches) != 0 {
+		t.Fatalf("temporary auth files = %v, %v", matches, errGlob)
 	}
 }
 

@@ -544,6 +544,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	if sessionID, routed := coreexecutor.CodexOAuthRoute(requestCtx); routed {
+		parentCtx = coreexecutor.WithCodexOAuthRoute(parentCtx, sessionID)
+	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
 	endpoint := ""

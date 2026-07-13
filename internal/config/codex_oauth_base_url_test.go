@@ -62,6 +62,9 @@ func TestLoadConfigCodexOAuthBaseURL(t *testing.T) {
 			if len(cfg.CodexOAuthHeaders) != 0 {
 				t.Fatalf("CodexOAuthHeaders = %#v, want empty", cfg.CodexOAuthHeaders)
 			}
+			if len(cfg.CodexOAuthRouteAPIKeys) != 0 {
+				t.Fatalf("CodexOAuthRouteAPIKeys = %#v, want empty", cfg.CodexOAuthRouteAPIKeys)
+			}
 		})
 	}
 }
@@ -82,6 +85,7 @@ func TestLoadConfigCodexOAuthHeaders(t *testing.T) {
 		{name: "authorization", header: "Authorization", wantErr: true},
 		{name: "host", header: "HOST", wantErr: true},
 		{name: "content length", header: "content-length", wantErr: true},
+		{name: "edgee session ID", header: "X-Edgee-Session-Id", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -128,6 +132,70 @@ func TestLoadConfigRejectsCodexOAuthHeadersWithoutBaseURL(t *testing.T) {
 	}
 }
 
+func TestLoadConfigCodexOAuthRouteAPIKeys(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "api-keys:\n  - ordinary-key\n  - route-key\n" +
+		"codex-oauth-base-url: https://api.edgee.ai/v1\n" +
+		"codex-oauth-route-api-keys:\n  - ' route-key '\n  - route-key\n"
+	if errWrite := os.WriteFile(configPath, []byte(contents), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+
+	cfg, errLoad := LoadConfig(configPath)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig() error = %v", errLoad)
+	}
+	if len(cfg.CodexOAuthRouteAPIKeys) != 1 || cfg.CodexOAuthRouteAPIKeys[0] != "route-key" {
+		t.Fatalf("CodexOAuthRouteAPIKeys = %#v, want normalized route key", cfg.CodexOAuthRouteAPIKeys)
+	}
+}
+
+func TestLoadConfigRejectsInvalidCodexOAuthRouteAPIKeys(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents string
+		want     string
+	}{
+		{
+			name:     "without base URL",
+			contents: "api-keys: [ordinary-key, route-key]\ncodex-oauth-route-api-keys: [route-key]\n",
+			want:     "codex-oauth-base-url",
+		},
+		{
+			name:     "empty entry",
+			contents: "api-keys: [ordinary-key, route-key]\ncodex-oauth-base-url: https://api.edgee.ai/v1\ncodex-oauth-route-api-keys: [' ']\n",
+			want:     "entry 0 must not be empty",
+		},
+		{
+			name:     "not an inbound API key",
+			contents: "api-keys: [ordinary-key]\ncodex-oauth-base-url: https://api.edgee.ai/v1\ncodex-oauth-route-api-keys: [unknown-key]\n",
+			want:     "must also be present in api-keys",
+		},
+		{
+			name:     "all inbound API keys routed",
+			contents: "api-keys: [route-key-1, route-key-2]\ncodex-oauth-base-url: https://api.edgee.ai/v1\ncodex-oauth-route-api-keys: [route-key-1, route-key-2]\n",
+			want:     "at least one api-keys entry must remain",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if errWrite := os.WriteFile(configPath, []byte(tt.contents), 0o600); errWrite != nil {
+				t.Fatalf("write config: %v", errWrite)
+			}
+
+			_, errLoad := LoadConfig(configPath)
+			if errLoad == nil {
+				t.Fatal("LoadConfig() error = nil, want route-key validation error")
+			}
+			if !strings.Contains(errLoad.Error(), "codex-oauth-route-api-keys") || !strings.Contains(errLoad.Error(), tt.want) {
+				t.Fatalf("LoadConfig() error = %q, want key name and %q", errLoad, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseConfigBytesValidatesCodexOAuthConfig(t *testing.T) {
 	cfg, errParse := ParseConfigBytes([]byte("codex-oauth-base-url: https://edge.example.com/codex/\ncodex-oauth-headers:\n  x-edgee-api-key: edge-key\n"))
 	if errParse != nil {
@@ -148,5 +216,10 @@ func TestParseConfigBytesValidatesCodexOAuthConfig(t *testing.T) {
 	_, errParse = ParseConfigBytes([]byte("codex-oauth-headers:\n  x-edgee-api-key: edge-key\n"))
 	if errParse == nil || !strings.Contains(errParse.Error(), "codex-oauth-headers") {
 		t.Fatalf("ParseConfigBytes() error = %v, want headers-only validation error", errParse)
+	}
+
+	_, errParse = ParseConfigBytes([]byte("api-keys: [route-key]\ncodex-oauth-base-url: https://edge.example.com/codex\ncodex-oauth-route-api-keys: [route-key]\n"))
+	if errParse == nil || !strings.Contains(errParse.Error(), "codex-oauth-route-api-keys") {
+		t.Fatalf("ParseConfigBytes() error = %v, want route-key validation error", errParse)
 	}
 }

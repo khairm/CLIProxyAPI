@@ -72,7 +72,7 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		return nil, sdkaccess.NewNoCredentialsError()
 	}
 
-	apiKey := extractBearerToken(authHeader)
+	apiKey, authorizationIsBearer := extractAuthorizationToken(authHeader)
 
 	candidates := []struct {
 		value  string
@@ -90,12 +90,16 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			continue
 		}
 		if _, ok := p.keys[candidate.value]; ok {
+			metadata := map[string]string{
+				"source": candidate.source,
+			}
+			if candidate.source == "authorization" && authorizationIsBearer {
+				metadata["credential-kind"] = "bearer"
+			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
+				Metadata:  metadata,
 			}, nil
 		}
 	}
@@ -103,18 +107,18 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 	return nil, sdkaccess.NewInvalidCredentialError()
 }
 
-func extractBearerToken(header string) string {
+func extractAuthorizationToken(header string) (token string, bearer bool) {
 	if header == "" {
-		return ""
+		return "", false
 	}
 	parts := strings.SplitN(header, " ", 2)
 	if len(parts) != 2 {
-		return header
+		return header, false
 	}
 	if strings.ToLower(parts[0]) != "bearer" {
-		return header
+		return header, false
 	}
-	return strings.TrimSpace(parts[1])
+	return strings.TrimSpace(parts[1]), true
 }
 
 func normalizeKeys(keys []string) []string {

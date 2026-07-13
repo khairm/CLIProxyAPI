@@ -104,6 +104,15 @@ func (w *Watcher) reloadConfig() bool {
 			newConfig.AuthDir = resolvedAuthDir
 		}
 	}
+	w.clientsMutex.RLock()
+	configValidator := w.configValidator
+	w.clientsMutex.RUnlock()
+	if configValidator != nil {
+		if errValidate := configValidator(newConfig); errValidate != nil {
+			log.Errorf("config reload rejected: %v", errValidate)
+			return false
+		}
+	}
 
 	w.clientsMutex.Lock()
 	var oldConfig *config.Config

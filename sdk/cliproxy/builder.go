@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -188,6 +189,9 @@ func (b *Builder) Build() (*Service, error) {
 	if b.configPath == "" {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
 	}
+	if errValidate := validateCodexOAuthRoutingConfig(b.cfg); errValidate != nil {
+		return nil, fmt.Errorf("cliproxy: invalid configuration: %w", errValidate)
+	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {
@@ -272,19 +276,20 @@ func (b *Builder) Build() (*Service, error) {
 	}
 
 	service := &Service{
-		cfg:               b.cfg,
-		codexOAuthBaseURL: b.cfg.CodexOAuthBaseURL,
-		codexOAuthHeaders: maps.Clone(b.cfg.CodexOAuthHeaders),
-		configPath:        b.configPath,
-		tokenProvider:     tokenProvider,
-		apiKeyProvider:    apiKeyProvider,
-		watcherFactory:    watcherFactory,
-		hooks:             b.hooks,
-		authManager:       authManager,
-		accessManager:     accessManager,
-		coreManager:       coreManager,
-		pluginHost:        pluginHost,
-		serverOptions:     append([]api.ServerOption(nil), b.serverOptions...),
+		cfg:                    b.cfg,
+		codexOAuthBaseURL:      b.cfg.CodexOAuthBaseURL,
+		codexOAuthHeaders:      maps.Clone(b.cfg.CodexOAuthHeaders),
+		codexOAuthRouteAPIKeys: slices.Clone(b.cfg.CodexOAuthRouteAPIKeys),
+		configPath:             b.configPath,
+		tokenProvider:          tokenProvider,
+		apiKeyProvider:         apiKeyProvider,
+		watcherFactory:         watcherFactory,
+		hooks:                  b.hooks,
+		authManager:            authManager,
+		accessManager:          accessManager,
+		coreManager:            coreManager,
+		pluginHost:             pluginHost,
+		serverOptions:          append([]api.ServerOption(nil), b.serverOptions...),
 	}
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
@@ -297,6 +302,16 @@ func (b *Builder) Build() (*Service, error) {
 		}),
 	)
 	return service, nil
+}
+
+func validateCodexOAuthRoutingConfig(cfg *config.Config) error {
+	if errNormalize := cfg.NormalizeCodexOAuthBaseURL(); errNormalize != nil {
+		return errNormalize
+	}
+	if errHeaders := cfg.ValidateCodexOAuthHeaders(); errHeaders != nil {
+		return errHeaders
+	}
+	return cfg.ValidateCodexOAuthRouteAPIKeys()
 }
 
 func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {

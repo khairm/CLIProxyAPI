@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
@@ -259,6 +260,7 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+	codexOAuthRouteAPIKeys       map[string]struct{}
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -337,6 +339,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		pluginHost:          optionState.pluginHost,
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
+		codexOAuthRouteAPIKeys:       stringSet(cfg.CodexOAuthRouteAPIKeys),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
@@ -518,7 +521,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.authMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -539,7 +542,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
-	openaiV1.Use(AuthMiddleware(s.accessManager))
+	openaiV1.Use(s.authMiddleware())
 	{
 		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
 		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
@@ -548,7 +551,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(s.authMiddleware())
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -557,7 +560,7 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.authMiddleware())
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/interactions", geminiHandlers.Interactions)
@@ -752,7 +755,7 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.wsRoutes[trimmed] = struct{}{}
 	s.wsRouteMu.Unlock()
 
-	authMiddleware := AuthMiddleware(s.accessManager)
+	authMiddleware := s.authMiddleware()
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -1956,6 +1959,17 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
 func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
+	return authMiddleware(manager, nil)
+}
+
+func (s *Server) authMiddleware() gin.HandlerFunc {
+	if s == nil {
+		return AuthMiddleware(nil)
+	}
+	return authMiddleware(s.accessManager, s.codexOAuthRouteAPIKeys)
+}
+
+func authMiddleware(manager *sdkaccess.Manager, codexOAuthRouteAPIKeys map[string]struct{}) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
 			c.Next()
@@ -1970,6 +1984,15 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
 				}
+				if isCodexOAuthRoutePrincipal(result, codexOAuthRouteAPIKeys) {
+					sessionID, errSessionID := validatedEdgeeSessionID(c.Request.Header)
+					if errSessionID != nil {
+						c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": errSessionID.Error()})
+						return
+					}
+					ctx := coreexecutor.WithCodexOAuthRoute(c.Request.Context(), sessionID)
+					c.Request = c.Request.WithContext(ctx)
+				}
 			}
 			c.Next()
 			return
@@ -1981,6 +2004,44 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
+}
+
+func isCodexOAuthRoutePrincipal(result *sdkaccess.Result, routeAPIKeys map[string]struct{}) bool {
+	if result == nil || result.Provider != sdkaccess.DefaultAccessProviderName {
+		return false
+	}
+	if result.Metadata["source"] != "authorization" || result.Metadata["credential-kind"] != "bearer" {
+		return false
+	}
+	_, routed := routeAPIKeys[result.Principal]
+	return routed
+}
+
+func stringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func validatedEdgeeSessionID(headers http.Header) (string, error) {
+	values := headers.Values("X-Edgee-Session-Id")
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("x-edgee-session-id must occur at most once")
+	}
+	raw := values[0]
+	parsed, errParse := uuid.Parse(raw)
+	if errParse != nil || parsed.String() != raw || parsed.Version() != 4 || parsed.Variant() != uuid.RFC4122 {
+		return "", fmt.Errorf("x-edgee-session-id must be a lowercase UUIDv4")
+	}
+	return raw, nil
 }
 
 func configuredSignatureCacheEnabled(cfg *config.Config) bool {

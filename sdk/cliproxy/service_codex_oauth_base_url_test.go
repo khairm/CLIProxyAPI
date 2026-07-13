@@ -79,17 +79,23 @@ func TestValidateCodexOAuthBaseURLAuthConflicts(t *testing.T) {
 func TestApplyConfigUpdateKeepsStartupCodexOAuthConfig(t *testing.T) {
 	startupURL := "https://startup.example.com/codex"
 	startupHeaders := map[string]string{"x-edgee-api-key": "startup-key"}
+	startupRouteAPIKeys := []string{"startup-route-key"}
 	service := &Service{
 		cfg: &config.Config{
-			CodexOAuthBaseURL: startupURL,
-			CodexOAuthHeaders: map[string]string{"x-edgee-api-key": "startup-key"},
+			SDKConfig:              config.SDKConfig{APIKeys: []string{"ordinary-key", "startup-route-key"}},
+			CodexOAuthBaseURL:      startupURL,
+			CodexOAuthHeaders:      map[string]string{"x-edgee-api-key": "startup-key"},
+			CodexOAuthRouteAPIKeys: []string{"startup-route-key"},
 		},
-		codexOAuthBaseURL: startupURL,
-		codexOAuthHeaders: startupHeaders,
+		codexOAuthBaseURL:      startupURL,
+		codexOAuthHeaders:      startupHeaders,
+		codexOAuthRouteAPIKeys: startupRouteAPIKeys,
 	}
 	reloaded := &config.Config{
-		CodexOAuthBaseURL: "https://reload.example.com/codex",
-		CodexOAuthHeaders: map[string]string{"x-edgee-api-key": "reload-key"},
+		SDKConfig:              config.SDKConfig{APIKeys: []string{"ordinary-key", "startup-route-key"}},
+		CodexOAuthBaseURL:      "https://reload.example.com/codex",
+		CodexOAuthHeaders:      map[string]string{"x-edgee-api-key": "reload-key"},
+		CodexOAuthRouteAPIKeys: []string{"reload-route-key"},
 	}
 
 	service.applyConfigUpdateWithAuthSynthesis(reloaded, false)
@@ -106,8 +112,83 @@ func TestApplyConfigUpdateKeepsStartupCodexOAuthConfig(t *testing.T) {
 	if got := service.cfg.CodexOAuthHeaders["x-edgee-api-key"]; got != "startup-key" {
 		t.Fatalf("service CodexOAuthHeaders value = %q, want startup value", got)
 	}
+	if got := reloaded.CodexOAuthRouteAPIKeys; len(got) != 1 || got[0] != "startup-route-key" {
+		t.Fatalf("reloaded CodexOAuthRouteAPIKeys = %#v, want startup route key", got)
+	}
+	if got := service.cfg.CodexOAuthRouteAPIKeys; len(got) != 1 || got[0] != "startup-route-key" {
+		t.Fatalf("service CodexOAuthRouteAPIKeys = %#v, want startup route key", got)
+	}
 	startupHeaders["x-edgee-api-key"] = "mutated-after-reload"
+	startupRouteAPIKeys[0] = "mutated-after-reload"
 	if got := reloaded.CodexOAuthHeaders["x-edgee-api-key"]; got != "startup-key" {
 		t.Fatalf("reloaded CodexOAuthHeaders aliases startup snapshot: got %q", got)
+	}
+	if got := reloaded.CodexOAuthRouteAPIKeys[0]; got != "startup-route-key" {
+		t.Fatalf("reloaded CodexOAuthRouteAPIKeys aliases startup snapshot: got %q", got)
+	}
+}
+
+func TestApplyConfigUpdateRejectsStartupRouteWithoutOrdinaryBearer(t *testing.T) {
+	startupURL := "https://startup.example.com/codex"
+	original := &config.Config{
+		SDKConfig:              config.SDKConfig{APIKeys: []string{"ordinary-key", "route-key"}},
+		CodexOAuthBaseURL:      startupURL,
+		CodexOAuthRouteAPIKeys: []string{"route-key"},
+	}
+	service := &Service{
+		cfg:                    original,
+		codexOAuthBaseURL:      startupURL,
+		codexOAuthRouteAPIKeys: []string{"route-key"},
+	}
+	reloaded := &config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"route-key"}},
+	}
+
+	service.applyConfigUpdateWithAuthSynthesis(reloaded, false)
+
+	if service.cfg != original {
+		t.Fatal("invalid config update replaced the active service config")
+	}
+}
+
+func TestApplyConfigUpdateRejectsMissingStartupRouteKey(t *testing.T) {
+	startupURL := "https://startup.example.com/codex"
+	original := &config.Config{
+		SDKConfig:              config.SDKConfig{APIKeys: []string{"ordinary-key", "route-key"}},
+		CodexOAuthBaseURL:      startupURL,
+		CodexOAuthRouteAPIKeys: []string{"route-key"},
+	}
+	service := &Service{
+		cfg:                    original,
+		codexOAuthBaseURL:      startupURL,
+		codexOAuthRouteAPIKeys: []string{"route-key"},
+	}
+	reloaded := &config.Config{
+		SDKConfig: config.SDKConfig{APIKeys: []string{"ordinary-key"}},
+	}
+
+	service.applyConfigUpdateWithAuthSynthesis(reloaded, false)
+
+	if service.cfg != original {
+		t.Fatal("config missing the startup route key replaced the active service config")
+	}
+}
+
+func TestBuilderRejectsInvalidCodexOAuthRoutingConfig(t *testing.T) {
+	cfg := &config.Config{
+		SDKConfig:              config.SDKConfig{APIKeys: []string{"route-key"}},
+		CodexOAuthBaseURL:      "https://edge.example.com/codex/",
+		CodexOAuthRouteAPIKeys: []string{"route-key"},
+	}
+
+	service, errBuild := NewBuilder().WithConfig(cfg).WithConfigPath(t.TempDir() + "/config.yaml").Build()
+	if errBuild == nil {
+		t.Fatal("Build() error = nil, want route validation error")
+	}
+	if service != nil {
+		t.Fatal("Build() service is non-nil after validation failure")
+	}
+	if !strings.Contains(errBuild.Error(), "at least one api-keys entry must remain") {
+		t.Fatalf("Build() error = %q, want ordinary bearer validation detail", errBuild)
 	}
 }

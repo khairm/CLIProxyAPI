@@ -134,6 +134,10 @@ type Config struct {
 	// It is captured at startup; configuration hot reloads do not change it.
 	CodexOAuthHeaders map[string]string `yaml:"codex-oauth-headers" json:"codex-oauth-headers"`
 
+	// CodexOAuthRouteAPIKeys lists inbound API keys that route Codex OAuth requests through CodexOAuthBaseURL.
+	// It is captured at startup; configuration hot reloads do not change it.
+	CodexOAuthRouteAPIKeys []string `yaml:"codex-oauth-route-api-keys" json:"codex-oauth-route-api-keys"`
+
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
@@ -772,6 +776,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = cfg.ValidateCodexOAuthHeaders(); err != nil {
 		return nil, err
 	}
+	if err = cfg.ValidateCodexOAuthRouteAPIKeys(); err != nil {
+		return nil, err
+	}
 
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -900,11 +907,54 @@ func (cfg *Config) ValidateCodexOAuthHeaders() error {
 			return fmt.Errorf("codex-oauth-headers: invalid header name %q", name)
 		}
 		switch strings.ToLower(name) {
-		case "authorization", "host", "content-length":
+		case "authorization", "host", "content-length", "x-edgee-session-id":
 			return fmt.Errorf("codex-oauth-headers: forbidden header %q", name)
 		}
 	}
 	return nil
+}
+
+// ValidateCodexOAuthRouteAPIKeys validates and normalizes the inbound API keys that opt in to Codex OAuth routing.
+func (cfg *Config) ValidateCodexOAuthRouteAPIKeys() error {
+	if cfg == nil || len(cfg.CodexOAuthRouteAPIKeys) == 0 {
+		return nil
+	}
+	if cfg.CodexOAuthBaseURL == "" {
+		return fmt.Errorf("codex-oauth-route-api-keys: codex-oauth-base-url must be set")
+	}
+
+	apiKeys := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, rawAPIKey := range cfg.APIKeys {
+		apiKey := strings.TrimSpace(rawAPIKey)
+		if apiKey != "" {
+			apiKeys[apiKey] = struct{}{}
+		}
+	}
+
+	routeKeys := make(map[string]struct{}, len(cfg.CodexOAuthRouteAPIKeys))
+	normalized := make([]string, 0, len(cfg.CodexOAuthRouteAPIKeys))
+	for index, rawRouteKey := range cfg.CodexOAuthRouteAPIKeys {
+		routeKey := strings.TrimSpace(rawRouteKey)
+		if routeKey == "" {
+			return fmt.Errorf("codex-oauth-route-api-keys: entry %d must not be empty", index)
+		}
+		if _, ok := apiKeys[routeKey]; !ok {
+			return fmt.Errorf("codex-oauth-route-api-keys: entry %d must also be present in api-keys", index)
+		}
+		if _, duplicate := routeKeys[routeKey]; duplicate {
+			continue
+		}
+		routeKeys[routeKey] = struct{}{}
+		normalized = append(normalized, routeKey)
+	}
+
+	for apiKey := range apiKeys {
+		if _, routed := routeKeys[apiKey]; !routed {
+			cfg.CodexOAuthRouteAPIKeys = normalized
+			return nil
+		}
+	}
+	return fmt.Errorf("codex-oauth-route-api-keys: at least one api-keys entry must remain outside the override route")
 }
 
 func isHTTPToken(value string) bool {

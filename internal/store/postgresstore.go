@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/atomicfile"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -199,12 +200,6 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
-		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
-			return "", nil
-		}
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -212,6 +207,12 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
 
+	relID, errRel := s.relativeAuthID(path)
+	if errRel != nil {
+		return "", errRel
+	}
+
+	var raw []byte
 	switch {
 	case auth.Storage != nil:
 		if auth.Metadata == nil {
@@ -221,50 +222,45 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
-			return "", err
+		raw, err = stageTokenStorage(auth.Storage, path)
+		if err != nil {
+			return "", fmt.Errorf("postgres store: stage token storage: %w", err)
 		}
 	case auth.Metadata != nil:
 		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
+		var errMarshal error
+		raw, errMarshal = json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
-		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				return path, nil
-			}
-		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
-			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
-		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
 		}
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
 	}
 
+	if errPersist := s.persistAuth(ctx, relID, raw); errPersist != nil {
+		return "", errPersist
+	}
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes[cliproxyauth.AttributePath] = path
 	auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourcePostgres
-
 	if strings.TrimSpace(auth.FileName) == "" {
 		auth.FileName = auth.ID
 	}
 
-	relID, err := s.relativeAuthID(path)
-	if err != nil {
-		return "", err
+	writeLocal := true
+	if existing, errRead := os.ReadFile(path); errRead == nil {
+		writeLocal = !jsonEqual(existing, raw)
+	} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
+		return path, &databaseCommittedError{err: fmt.Errorf("postgres store: read existing metadata: %w", errRead)}
 	}
-	if err = s.upsertAuthRecord(ctx, relID, path); err != nil {
-		return "", err
+	if writeLocal {
+		if errWrite := atomicfile.WriteFile(path, raw, 0o600); errWrite != nil {
+			return path, &databaseCommittedError{err: fmt.Errorf("postgres store: write auth file atomically: %w", errWrite)}
+		}
 	}
+
 	return path, nil
 }
 
@@ -506,15 +502,35 @@ func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) er
 	return s.persistAuth(ctx, relID, data)
 }
 
-func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("postgres store: read auth file: %w", err)
+func stageTokenStorage(storage interface{ SaveTokenToFile(string) error }, livePath string) (data []byte, err error) {
+	if storage == nil {
+		return nil, fmt.Errorf("token storage is nil")
 	}
-	if len(data) == 0 {
-		return s.deleteAuthRecord(ctx, relID)
+	dir := filepath.Dir(livePath)
+	tempFile, errCreate := os.CreateTemp(dir, "."+filepath.Base(livePath)+".stage-*")
+	if errCreate != nil {
+		return nil, fmt.Errorf("create stage file: %w", errCreate)
 	}
-	return s.persistAuth(ctx, relID, data)
+	stagePath := tempFile.Name()
+	defer func() {
+		if errRemove := os.Remove(stagePath); errRemove != nil && !os.IsNotExist(errRemove) {
+			err = errors.Join(err, fmt.Errorf("remove stage file: %w", errRemove))
+		}
+	}()
+	if errClose := tempFile.Close(); errClose != nil {
+		return nil, fmt.Errorf("close stage placeholder: %w", errClose)
+	}
+	if errRemove := os.Remove(stagePath); errRemove != nil {
+		return nil, fmt.Errorf("remove stage placeholder: %w", errRemove)
+	}
+	if errSave := storage.SaveTokenToFile(stagePath); errSave != nil {
+		return nil, errSave
+	}
+	data, errRead := os.ReadFile(stagePath)
+	if errRead != nil {
+		return nil, fmt.Errorf("read stage file: %w", errRead)
+	}
+	return data, nil
 }
 
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
@@ -590,6 +606,22 @@ func (s *PostgresStore) resolveDeletePath(id string) (string, error) {
 		return id, nil
 	}
 	return filepath.Join(s.authDir, filepath.FromSlash(id)), nil
+}
+
+type databaseCommittedError struct {
+	err error
+}
+
+func (e *databaseCommittedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *databaseCommittedError) Unwrap() error {
+	return e.err
+}
+
+func (e *databaseCommittedError) PersistenceCommitted() bool {
+	return true
 }
 
 func (s *PostgresStore) relativeAuthID(path string) (string, error) {

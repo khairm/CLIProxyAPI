@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,9 @@ type Service struct {
 
 	// codexOAuthHeaders is immutable for the lifetime of the service.
 	codexOAuthHeaders map[string]string
+
+	// codexOAuthRouteAPIKeys is immutable for the lifetime of the service.
+	codexOAuthRouteAPIKeys []string
 
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
@@ -1282,8 +1286,10 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	if newCfg == nil {
 		return
 	}
-	newCfg.CodexOAuthBaseURL = s.codexOAuthBaseURL
-	newCfg.CodexOAuthHeaders = maps.Clone(s.codexOAuthHeaders)
+	if errValidate := s.prepareCodexOAuthRoutingConfigForReload(newCfg); errValidate != nil {
+		log.Errorf("config update rejected: invalid startup Codex OAuth routing configuration: %v", errValidate)
+		return
+	}
 
 	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
 	normalizeStrategy := func(strategy string) string {
@@ -1362,6 +1368,19 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		}
 	}
 	s.syncPluginModelRuntime(ctx)
+}
+
+func (s *Service) prepareCodexOAuthRoutingConfigForReload(newCfg *config.Config) error {
+	if s == nil {
+		return fmt.Errorf("service is nil")
+	}
+	if newCfg == nil {
+		return fmt.Errorf("configuration is nil")
+	}
+	newCfg.CodexOAuthBaseURL = s.codexOAuthBaseURL
+	newCfg.CodexOAuthHeaders = maps.Clone(s.codexOAuthHeaders)
+	newCfg.CodexOAuthRouteAPIKeys = slices.Clone(s.codexOAuthRouteAPIKeys)
+	return validateCodexOAuthRoutingConfig(newCfg)
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
@@ -1761,6 +1780,7 @@ func (s *Service) Run(ctx context.Context) error {
 			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
 		}
 		s.watcher = watcherWrapper
+		watcherWrapper.SetConfigValidator(s.prepareCodexOAuthRoutingConfigForReload)
 		s.ensureAuthUpdateQueue(ctx)
 		if s.authUpdates != nil {
 			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)

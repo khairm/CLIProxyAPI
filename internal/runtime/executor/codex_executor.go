@@ -777,7 +777,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -956,7 +956,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1059,7 +1059,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1610,11 +1610,15 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func (e *CodexExecutor) applyCodexOAuthHeaders(r *http.Request, auth *cliproxyauth.Auth) {
-	if r == nil || !e.usesConfiguredOAuthBaseURL(auth) {
+	if r == nil || !e.usesConfiguredOAuthBaseURL(r.Context(), auth) {
 		return
 	}
 	for name, value := range e.codexOAuthHeaders {
 		r.Header.Set(name, value)
+	}
+	r.Header.Del("X-Edgee-Session-Id")
+	if sessionID, _ := cliproxyexecutor.CodexOAuthRoute(r.Context()); sessionID != "" {
+		r.Header.Set("X-Edgee-Session-Id", sessionID)
 	}
 }
 
@@ -1954,9 +1958,9 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	return
 }
 
-func (e *CodexExecutor) codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+func (e *CodexExecutor) codexCreds(ctx context.Context, a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	apiKey, baseURL = codexCreds(a)
-	if e.usesConfiguredOAuthBaseURL(a) {
+	if e.usesConfiguredOAuthBaseURL(ctx, a) {
 		baseURL = e.codexOAuthBaseURL
 	}
 	if baseURL == "" {
@@ -1965,8 +1969,11 @@ func (e *CodexExecutor) codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string
 	return apiKey, baseURL
 }
 
-func (e *CodexExecutor) usesConfiguredOAuthBaseURL(a *cliproxyauth.Auth) bool {
+func (e *CodexExecutor) usesConfiguredOAuthBaseURL(ctx context.Context, a *cliproxyauth.Auth) bool {
 	if e == nil || e.codexOAuthBaseURL == "" || a == nil {
+		return false
+	}
+	if _, routed := cliproxyexecutor.CodexOAuthRoute(ctx); !routed {
 		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
@@ -1976,10 +1983,13 @@ func (e *CodexExecutor) usesConfiguredOAuthBaseURL(a *cliproxyauth.Auth) bool {
 }
 
 func (e *CodexExecutor) routeCodexOAuthHTTPRequest(req *http.Request, auth *cliproxyauth.Auth) error {
-	if !e.usesConfiguredOAuthBaseURL(auth) {
+	if req == nil {
 		return nil
 	}
-	if req == nil || req.URL == nil {
+	if !e.usesConfiguredOAuthBaseURL(req.Context(), auth) {
+		return nil
+	}
+	if req.URL == nil {
 		return fmt.Errorf("codex executor: request URL is nil")
 	}
 

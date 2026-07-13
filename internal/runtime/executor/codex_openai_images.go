@@ -91,7 +91,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, errPrepare
 	}
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	mainModel := e.resolveGPTImage2BaseModel()
 	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
@@ -186,7 +186,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, errPrepare
 	}
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	mainModel := e.resolveGPTImage2BaseModel()
 	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
@@ -317,7 +317,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		return resp, errPrepare
 	}
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -376,7 +376,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 		return nil, errPrepare
 	}
 
-	apiKey, baseURL := e.codexCreds(auth)
+	apiKey, baseURL := e.codexCreds(ctx, auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)

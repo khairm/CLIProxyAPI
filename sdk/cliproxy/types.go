@@ -99,6 +99,7 @@ type WatcherWrapper struct {
 	stop  func() error
 
 	setConfig             func(cfg *config.Config)
+	setConfigValidator    func(validator func(*config.Config) error)
 	snapshotAuths         func() []*coreauth.Auth
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
@@ -129,6 +130,14 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 		return
 	}
 	w.setConfig(cfg)
+}
+
+// SetConfigValidator validates a reloaded config before the watcher commits it.
+func (w *WatcherWrapper) SetConfigValidator(validator func(*config.Config) error) {
+	if w == nil || w.setConfigValidator == nil {
+		return
+	}
+	w.setConfigValidator(validator)
 }
 
 // ReloadConfigIfChanged asks the underlying watcher to reload config from disk.

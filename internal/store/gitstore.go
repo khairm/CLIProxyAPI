@@ -18,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/atomicfile"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -303,19 +304,18 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
+		writeLocal := true
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
-				return path, nil
+				writeLocal = false
 			}
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
+		if writeLocal {
+			if errWrite := atomicfile.WriteFile(path, raw, 0o600); errWrite != nil {
+				return "", fmt.Errorf("auth filestore: write atomically failed: %w", errWrite)
+			}
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -835,7 +835,7 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 		return fmt.Errorf("git token store: status: %w", err)
 	}
 	if status.IsClean() {
-		return nil
+		return s.pushRepository(repo, repoDir)
 	}
 	if strings.TrimSpace(message) == "" {
 		message = "Update auth store"
@@ -862,6 +862,10 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
 		return errRewrite
 	}
+	return s.pushRepository(repo, repoDir)
+}
+
+func (s *GitTokenStore) pushRepository(repo *git.Repository, repoDir string) error {
 	pushOpts := &git.PushOptions{Auth: s.gitAuth(), Force: true}
 	if s.branch != "" {
 		pushOpts.RefSpecs = []config.RefSpec{config.RefSpec("refs/heads/" + s.branch + ":refs/heads/" + s.branch)}
@@ -871,11 +875,11 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 			pushOpts.RefSpecs = []config.RefSpec{config.RefSpec(headRef.Name().String() + ":" + headRef.Name().String())}
 		}
 	}
-	if err = repo.Push(pushOpts); err != nil {
-		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+	if errPush := repo.Push(pushOpts); errPush != nil {
+		if errors.Is(errPush, git.NoErrAlreadyUpToDate) {
 			return nil
 		}
-		return fmt.Errorf("git token store: push: %w", err)
+		return fmt.Errorf("git token store: push: %w", errPush)
 	}
 	s.maybeRunGC(repoDir)
 	return nil

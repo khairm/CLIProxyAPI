@@ -15,3 +15,8 @@ type TokenStorage interface {
 	//   - error: An error if the save operation fails, nil otherwise
 	SaveTokenToFile(authFilePath string) error
 }
+
+// CloneableTokenStorage can provide an independent copy for staged persistence.
+type CloneableTokenStorage interface {
+	CloneTokenStorage() TokenStorage
+}

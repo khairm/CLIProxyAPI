@@ -1,48 +1,23 @@
 package main
 
 import (
-	"context"
-	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"testing"
-
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestFetchModelsUsesConfiguredBaseURL(t *testing.T) {
-	var gotPath string
-	var gotClientVersion string
-	var gotEdgeKey string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotClientVersion = r.URL.Query().Get("client_version")
-		gotEdgeKey = r.Header.Get("X-Edgee-Api-Key")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"models":[]}`))
-	}))
-	defer server.Close()
-
-	_, count, errFetch := fetchModels(
-		context.Background(),
-		&coreauth.Auth{},
-		"oauth-token",
-		server.URL+"/codex/",
-		"test-version",
-		map[string]string{"x-edgee-api-key": "edge-key"},
-	)
-	if errFetch != nil {
-		t.Fatalf("fetchModels() error = %v", errFetch)
+func TestCodexModelsURLUsesStockRoute(t *testing.T) {
+	rawURL, errURL := codexModelsURL("test-version")
+	if errURL != nil {
+		t.Fatalf("codexModelsURL() error = %v", errURL)
 	}
-	if count != 0 {
-		t.Fatalf("model count = %d, want 0", count)
+	parsed, errParse := url.Parse(rawURL)
+	if errParse != nil {
+		t.Fatalf("parse models URL: %v", errParse)
 	}
-	if gotPath != "/codex/models" {
-		t.Fatalf("request path = %q, want /codex/models", gotPath)
+	if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != codexModelsBaseURL+codexModelsPath {
+		t.Fatalf("models URL = %q, want stock route %q", got, codexModelsBaseURL+codexModelsPath)
 	}
-	if gotClientVersion != "test-version" {
-		t.Fatalf("client_version = %q, want test-version", gotClientVersion)
-	}
-	if gotEdgeKey != "edge-key" {
-		t.Fatalf("X-Edgee-Api-Key = %q, want configured header", gotEdgeKey)
+	if got := parsed.Query().Get("client_version"); got != "test-version" {
+		t.Fatalf("client_version = %q, want test-version", got)
 	}
 }
