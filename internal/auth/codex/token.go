@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/atomicfile"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 )
 
@@ -43,6 +45,21 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// CloneTokenStorage returns an independent copy suitable for staged persistence.
+func (ts *CodexTokenStorage) CloneTokenStorage() baseauth.TokenStorage {
+	if ts == nil {
+		return (*CodexTokenStorage)(nil)
+	}
+	cloned := *ts
+	if ts.Metadata != nil {
+		cloned.Metadata = make(map[string]any, len(ts.Metadata))
+		for key, value := range ts.Metadata {
+			cloned.Metadata[key] = value
+		}
+	}
+	return &cloned
+}
+
 // SaveTokenToFile serializes the Codex token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
@@ -53,29 +70,28 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 //
 // Returns:
 //   - error: An error if the operation fails, nil otherwise
-func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
+func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) (err error) {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "codex"
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
 
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	// Merge metadata using helper
+	// Build the complete payload before touching the existing credential file.
 	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
 	if errMerge != nil {
 		return fmt.Errorf("failed to merge metadata: %w", errMerge)
 	}
+	payload, errMarshal := json.Marshal(data)
+	if errMarshal != nil {
+		return fmt.Errorf("failed to marshal token: %w", errMarshal)
+	}
+	payload = append(payload, '\n')
 
-	if err = json.NewEncoder(f).Encode(data); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	dir := filepath.Dir(authFilePath)
+	if errMkdir := os.MkdirAll(dir, 0700); errMkdir != nil {
+		return fmt.Errorf("failed to create directory: %w", errMkdir)
+	}
+
+	if errWrite := atomicfile.WriteFile(authFilePath, payload, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write token file atomically: %w", errWrite)
 	}
 	return nil
 

@@ -127,16 +127,6 @@ func main() {
 	}
 
 	fmt.Printf("Using auth: id=%s label=%s\n", chosen.ID, chosen.Label)
-	modelsBaseURL := codexModelsBaseURL
-	var modelsOAuthHeaders map[string]string
-	if cfg.CodexOAuthBaseURL != "" && (chosen.Attributes == nil || strings.TrimSpace(chosen.Attributes["api_key"]) == "") {
-		if authBaseURL := codexAuthBaseURL(chosen); authBaseURL != "" {
-			fmt.Fprintf(os.Stderr, "error: codex-oauth-base-url conflicts with Codex OAuth auth %q base_url %q\n", chosen.ID, authBaseURL)
-			os.Exit(1)
-		}
-		modelsBaseURL = cfg.CodexOAuthBaseURL
-		modelsOAuthHeaders = cfg.CodexOAuthHeaders
-	}
 
 	accessToken, refreshed, err := ensureAccessToken(ctx, fileStore, chosen)
 	if err != nil {
@@ -149,7 +139,7 @@ func main() {
 
 	fmt.Println("Fetching Codex model list from upstream...")
 
-	raw, count, err := fetchModels(ctx, chosen, accessToken, modelsBaseURL, clientVersion, modelsOAuthHeaders)
+	raw, count, err := fetchModels(ctx, chosen, accessToken, clientVersion)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to fetch codex models: %v\n", err)
 		os.Exit(1)
@@ -238,8 +228,8 @@ func ensureAccessToken(ctx context.Context, store *sdkauth.FileTokenStore, auth 
 	return tokenData.AccessToken, true, nil
 }
 
-func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, baseURL, clientVersion string, oauthHeaders map[string]string) ([]byte, int, error) {
-	modelsURL, errURL := codexModelsURL(baseURL, clientVersion)
+func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVersion string) ([]byte, int, error) {
+	modelsURL, errURL := codexModelsURL(clientVersion)
 	if errURL != nil {
 		return nil, 0, errURL
 	}
@@ -259,10 +249,6 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, baseURL,
 	if auth != nil {
 		util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
 	}
-	for name, value := range oauthHeaders {
-		httpReq.Header.Set(name, value)
-	}
-
 	httpClient := &http.Client{}
 	if auth != nil {
 		if transport, _, errProxy := proxyutil.BuildHTTPTransport(auth.ProxyURL); errProxy == nil && transport != nil {
@@ -294,8 +280,8 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, baseURL,
 	return bodyBytes, count, nil
 }
 
-func codexModelsURL(baseURL, clientVersion string) (string, error) {
-	u, err := url.Parse(strings.TrimSuffix(baseURL, "/") + codexModelsPath)
+func codexModelsURL(clientVersion string) (string, error) {
+	u, err := url.Parse(codexModelsBaseURL + codexModelsPath)
 	if err != nil {
 		return "", err
 	}
@@ -305,18 +291,6 @@ func codexModelsURL(baseURL, clientVersion string) (string, error) {
 		u.RawQuery = q.Encode()
 	}
 	return u.String(), nil
-}
-
-func codexAuthBaseURL(auth *coreauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	if auth.Attributes != nil {
-		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
-			return baseURL
-		}
-	}
-	return metaStringValue(auth.Metadata, "base_url")
 }
 
 func countModels(raw []byte) (int, error) {

@@ -1,6 +1,9 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Store abstracts persistence of Auth state across restarts.
 type Store interface {
@@ -10,4 +13,14 @@ type Store interface {
 	Save(ctx context.Context, auth *Auth) (string, error)
 	// Delete removes the auth record identified by id.
 	Delete(ctx context.Context, id string) error
+}
+
+type persistenceCommittedError interface {
+	error
+	PersistenceCommitted() bool
+}
+
+func persistenceWasCommitted(err error) bool {
+	var committed persistenceCommittedError
+	return errors.As(err, &committed) && committed.PersistenceCommitted()
 }

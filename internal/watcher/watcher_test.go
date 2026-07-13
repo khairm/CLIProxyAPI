@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -224,6 +225,48 @@ func TestReloadConfigIfChanged_TriggersOnChangeAndSkipsUnchanged(t *testing.T) {
 	defer w.clientsMutex.RUnlock()
 	if w.config == nil || w.config.Port != 9090 || !w.config.RemoteManagement.AllowRemote {
 		t.Fatalf("expected config to be updated after reload, got %+v", w.config)
+	}
+}
+
+func TestReloadConfigRejectsBeforeCommittingInvalidConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if errMkdir := os.MkdirAll(authDir, 0o755); errMkdir != nil {
+		t.Fatalf("create auth dir: %v", errMkdir)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	invalid := &config.Config{Port: 9090, AuthDir: authDir}
+	data, errMarshal := yaml.Marshal(invalid)
+	if errMarshal != nil {
+		t.Fatalf("marshal config: %v", errMarshal)
+	}
+	if errWrite := os.WriteFile(configPath, data, 0o644); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+
+	original := &config.Config{Port: 8080, AuthDir: authDir}
+	reloads := 0
+	w := &Watcher{
+		configPath:     configPath,
+		authDir:        authDir,
+		config:         original,
+		reloadCallback: func(*config.Config) { reloads++ },
+		configValidator: func(cfg *config.Config) error {
+			if cfg.Port == 9090 {
+				return errors.New("port rejected")
+			}
+			return nil
+		},
+	}
+
+	if reloaded := w.reloadConfig(); reloaded {
+		t.Fatal("reloadConfig() = true, want rejected reload")
+	}
+	if reloads != 0 {
+		t.Fatalf("reload callback calls = %d, want 0", reloads)
+	}
+	if w.config != original {
+		t.Fatal("rejected config replaced watcher config")
 	}
 }
 

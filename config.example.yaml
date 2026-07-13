@@ -191,6 +191,15 @@ codex-oauth-headers: {}
 # codex-oauth-headers:
 #   x-edgee-api-key: "your-edgee-api-key"
 
+# Inbound API keys from api-keys that opt Authorization: Bearer requests into the override route.
+# Empty disables override routing. At least one api-keys entry must remain ordinary (unrouted).
+# For routed requests only, a single x-edgee-session-id value is forwarded when it is a
+# lowercase UUIDv4; an absent header is omitted. This setting is captured at startup.
+codex-oauth-route-api-keys: []
+# Example:
+# codex-oauth-route-api-keys:
+#   - "your-routed-api-key"
+
 # Codex provider behavior.
 codex:
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,

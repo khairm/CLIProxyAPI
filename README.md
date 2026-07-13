@@ -5,7 +5,7 @@ English | [中文](README_CN.md) | [日本語](README_JA.md)
 A proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.
 
 > [!NOTE]
-> **This is the `claude-all` edgee fork.** It adds two config keys (`codex-oauth-base-url`, `codex-oauth-headers`) for routing ChatGPT-Codex OAuth traffic through a companion proxy, bumps the version string to `7.2.62+edgee.1`, and ships a pinned windows/arm64 release via `.github/workflows/edgee-release.yml` (upstream tag-triggered release workflows are disabled here). Upstream PR: router-for-me/CLIProxyAPI#4258.
+> **This is the `claude-all` edgee fork.** It adds opt-in per-request routing through `codex-oauth-base-url` for selected inbound API keys, bumps the version string to `7.2.62+edgee.2`, and ships a pinned windows/arm64 release via `.github/workflows/edgee-release.yml` (upstream tag-triggered release workflows are disabled here). Upstream PR: router-for-me/CLIProxyAPI#4258.
 >
 > **Rebase procedure** (adopting a newer upstream version): `git fetch upstream --tags`, branch from the new upstream tag, cherry-pick the feature commit (and this README/workflow commit), resolve conflicts, run the five patched-package test suites, bump the fork version string to `<upstream>+edgee.1`, tag `v<upstream>-edgee.1`, let `edgee-release.yml` publish, then update both SHA pins and the version-probe regex in claude-all's `scripts/claude-all.ps1` and `scripts/install.ps1`.
 >

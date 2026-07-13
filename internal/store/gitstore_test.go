@@ -273,6 +273,69 @@ func TestCommitAndPushLockedPushesBeforeRunningGC(t *testing.T) {
 	}
 }
 
+func TestCommitAndPushLockedRetriesPreviouslyCommittedCleanChange(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	path := filepath.Join(root, "workspace", "auths", "codex.json")
+	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
+		t.Fatalf("create auth directory: %v", errMkdir)
+	}
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","access_token":"new"}`), 0o600); errWrite != nil {
+		t.Fatalf("write local auth: %v", errWrite)
+	}
+	repo, errOpen := git.PlainOpen(filepath.Join(root, "workspace"))
+	if errOpen != nil {
+		t.Fatalf("open workspace: %v", errOpen)
+	}
+	worktree, errWorktree := repo.Worktree()
+	if errWorktree != nil {
+		t.Fatalf("worktree: %v", errWorktree)
+	}
+	if _, errAdd := worktree.Add("auths/codex.json"); errAdd != nil {
+		t.Fatalf("add auth: %v", errAdd)
+	}
+	if _, errCommit := worktree.Commit("local auth update", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()}}); errCommit != nil {
+		t.Fatalf("commit local auth: %v", errCommit)
+	}
+
+	store.mu.Lock()
+	errPush := store.commitAndPushLocked("retry auth update", "auths/codex.json")
+	store.mu.Unlock()
+	if errPush != nil {
+		t.Fatalf("commitAndPushLocked retry: %v", errPush)
+	}
+
+	remote, errRemote := git.PlainOpen(remoteDir)
+	if errRemote != nil {
+		t.Fatalf("open remote: %v", errRemote)
+	}
+	ref, errRef := remote.Reference(plumbing.NewBranchReferenceName("master"), true)
+	if errRef != nil {
+		t.Fatalf("remote branch: %v", errRef)
+	}
+	commit, errCommit := remote.CommitObject(ref.Hash())
+	if errCommit != nil {
+		t.Fatalf("remote commit: %v", errCommit)
+	}
+	file, errFile := commit.File("auths/codex.json")
+	if errFile != nil {
+		t.Fatalf("remote auth file: %v", errFile)
+	}
+	contents, errContents := file.Contents()
+	if errContents != nil || contents != `{"type":"codex","access_token":"new"}` {
+		t.Fatalf("remote auth = %q, %v", contents, errContents)
+	}
+}
+
 func TestEnsureRepositoryFollowsRenamedRemoteDefaultBranchWhenAvailable(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "master",
