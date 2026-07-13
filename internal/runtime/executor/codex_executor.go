@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -35,6 +37,7 @@ import (
 )
 
 const (
+	codexDefaultBaseURL        = "https://chatgpt.com/backend-api/codex"
 	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
@@ -226,10 +229,20 @@ func codexTerminalErrorIsContextLength(body []byte) bool {
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
-	cfg *config.Config
+	cfg               *config.Config
+	codexOAuthBaseURL string
+	codexOAuthHeaders map[string]string
 }
 
-func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
+func NewCodexExecutor(cfg *config.Config) *CodexExecutor {
+	var codexOAuthBaseURL string
+	var codexOAuthHeaders map[string]string
+	if cfg != nil {
+		codexOAuthBaseURL = cfg.CodexOAuthBaseURL
+		codexOAuthHeaders = maps.Clone(cfg.CodexOAuthHeaders)
+	}
+	return &CodexExecutor{cfg: cfg, codexOAuthBaseURL: codexOAuthBaseURL, codexOAuthHeaders: codexOAuthHeaders}
+}
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
@@ -713,6 +726,9 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
+	if errRoute := e.routeCodexOAuthHTTPRequest(req, auth); errRoute != nil {
+		return errRoute
+	}
 	apiKey, _ := codexCreds(auth)
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -722,6 +738,7 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	e.applyCodexOAuthHeaders(req, auth)
 	return nil
 }
 
@@ -750,10 +767,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := e.codexCreds(auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -803,6 +817,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	e.applyCodexOAuthHeaders(httpReq, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -931,10 +946,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := e.codexCreds(auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -976,6 +988,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	e.applyCodexOAuthHeaders(httpReq, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1039,10 +1052,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
-	}
+	apiKey, baseURL := e.codexCreds(auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -1091,6 +1101,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	e.applyCodexOAuthHeaders(httpReq, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1591,6 +1602,15 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
+func (e *CodexExecutor) applyCodexOAuthHeaders(r *http.Request, auth *cliproxyauth.Auth) {
+	if r == nil || !e.usesConfiguredOAuthBaseURL(auth) {
+		return
+	}
+	for name, value := range e.codexOAuthHeaders {
+		r.Header.Set(name, value)
+	}
+}
+
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
 func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	if headers == nil {
@@ -1925,6 +1945,68 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func (e *CodexExecutor) codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+	apiKey, baseURL = codexCreds(a)
+	if e.usesConfiguredOAuthBaseURL(a) {
+		baseURL = e.codexOAuthBaseURL
+	}
+	if baseURL == "" {
+		baseURL = codexDefaultBaseURL
+	}
+	return apiKey, baseURL
+}
+
+func (e *CodexExecutor) usesConfiguredOAuthBaseURL(a *cliproxyauth.Auth) bool {
+	if e == nil || e.codexOAuthBaseURL == "" || a == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+		return false
+	}
+	return a.Attributes == nil || strings.TrimSpace(a.Attributes["api_key"]) == ""
+}
+
+func (e *CodexExecutor) routeCodexOAuthHTTPRequest(req *http.Request, auth *cliproxyauth.Auth) error {
+	if !e.usesConfiguredOAuthBaseURL(auth) {
+		return nil
+	}
+	if req == nil || req.URL == nil {
+		return fmt.Errorf("codex executor: request URL is nil")
+	}
+
+	configuredBase, errConfigured := url.Parse(e.codexOAuthBaseURL)
+	if errConfigured != nil {
+		return fmt.Errorf("codex executor: invalid codex-oauth-base-url: %w", errConfigured)
+	}
+	if codexRequestURLUsesBase(req.URL, configuredBase) {
+		return nil
+	}
+
+	defaultBase, errDefault := url.Parse(codexDefaultBaseURL)
+	if errDefault != nil {
+		return fmt.Errorf("codex executor: invalid default Codex base URL: %w", errDefault)
+	}
+	if !codexRequestURLUsesBase(req.URL, defaultBase) {
+		return fmt.Errorf("codex executor: OAuth request URL %q does not use codex-oauth-base-url %q", req.URL.String(), e.codexOAuthBaseURL)
+	}
+
+	defaultPath := strings.TrimSuffix(defaultBase.Path, "/")
+	suffix := strings.TrimPrefix(req.URL.Path, defaultPath)
+	configuredBase.Path = strings.TrimSuffix(configuredBase.Path, "/") + suffix
+	configuredBase.RawQuery = req.URL.RawQuery
+	req.URL = configuredBase
+	req.Host = ""
+	return nil
+}
+
+func codexRequestURLUsesBase(requestURL, baseURL *url.URL) bool {
+	if requestURL == nil || baseURL == nil || !strings.EqualFold(requestURL.Scheme, baseURL.Scheme) || !strings.EqualFold(requestURL.Host, baseURL.Host) {
+		return false
+	}
+	basePath := strings.TrimSuffix(baseURL.Path, "/")
+	return requestURL.Path == basePath || strings.HasPrefix(requestURL.Path, basePath+"/")
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
