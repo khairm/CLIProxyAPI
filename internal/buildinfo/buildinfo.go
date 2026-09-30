@@ -5,7 +5,7 @@ package buildinfo
 // Defaults cover local development builds.
 var (
 	// Version is the semantic version or git describe output of the binary.
-	Version = "7.2.62+edgee.5"
+	Version = "7.2.62+edgee.6"
 
 	// Commit is the git commit SHA baked into the binary.
 	Commit = "none"

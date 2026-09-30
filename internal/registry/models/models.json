@@ -1671,6 +1671,37 @@
       ]
     },
     {
+      "id": "gpt-6.1-sol",
+      "object": "model",
+      "created": 1790640000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Sol",
+      "version": "gpt-6.1",
+      "description": "Latest workhorse model for coding and everyday work.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "gpt-6-luna",
       "object": "model",
       "created": 1790035200,
@@ -1959,6 +1990,37 @@
       ]
     },
     {
+      "id": "gpt-6.1-sol",
+      "object": "model",
+      "created": 1790640000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Sol",
+      "version": "gpt-6.1",
+      "description": "Latest workhorse model for coding and everyday work.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "gpt-6-luna",
       "object": "model",
       "created": 1790035200,
@@ -2224,6 +2286,37 @@
       "display_name": "GPT 6.0 Sol",
       "version": "gpt-6.0",
       "description": "Workhorse model for coding and everyday work.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "object": "model",
+      "created": 1790640000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 6.1 Sol",
+      "version": "gpt-6.1",
+      "description": "Latest workhorse model for coding and everyday work.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
