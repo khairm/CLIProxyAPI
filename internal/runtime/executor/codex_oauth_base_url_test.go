@@ -23,15 +23,17 @@ func (f codexOAuthRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 	return f(req)
 }
 
-func codexOAuthCompletedResponse(req *http.Request) *http.Response {
+func codexOAuthSSEResponse(req *http.Request, sse string) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"text/event-stream"}},
-		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n",
-		)),
-		Request: req,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+		Request:    req,
 	}
+}
+
+func codexOAuthCompletedResponse(req *http.Request) *http.Response {
+	return codexOAuthSSEResponse(req, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
 }
 
 func codexOAuthExecutionContext(apiKey, requestID string, routed bool, sessionID string, rt http.RoundTripper) context.Context {

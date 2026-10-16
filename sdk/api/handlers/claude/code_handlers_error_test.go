@@ -75,6 +75,45 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 }
 
+func TestWriteClaudeErrorResponseEdgeeTerminalPassthroughBodies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		status  int
+		errType string
+		message string
+	}{
+		{http.StatusBadRequest, "invalid_request_error", "This request was blocked by our safety systems. Reason: Potentially unintended activity."},
+		{http.StatusTooManyRequests, "rate_limit_error", "slow"},
+		{http.StatusInternalServerError, "api_error", "busy"},
+	}
+	for _, tc := range cases {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		handler := &ClaudeCodeAPIHandler{}
+		handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+			StatusCode: tc.status,
+			Error:      errors.New(`{"error":{"type":"` + tc.errType + `","message":"` + tc.message + `"}}`),
+		})
+
+		if recorder.Code != tc.status {
+			t.Fatalf("status = %d, want %d", recorder.Code, tc.status)
+		}
+		body := recorder.Body.Bytes()
+		if got := gjson.GetBytes(body, "type").String(); got != "error" {
+			t.Fatalf("type = %q, want error; body=%s", got, body)
+		}
+		if !gjson.GetBytes(body, "error").IsObject() {
+			t.Fatalf("error is not an object; body=%s", body)
+		}
+		if got := gjson.GetBytes(body, "error.type").String(); got != tc.errType {
+			t.Fatalf("error.type = %q, want %q; body=%s", got, tc.errType, body)
+		}
+		if got := gjson.GetBytes(body, "error.message").String(); got != tc.message {
+			t.Fatalf("error.message = %q, want %q; body=%s", got, tc.message, body)
+		}
+	}
+}
+
 func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	wantErr := &interfaces.ErrorMessage{
 		StatusCode: http.StatusBadRequest,

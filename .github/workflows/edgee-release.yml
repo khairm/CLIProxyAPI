@@ -34,6 +34,7 @@ jobs:
             ./internal/runtime/executor/helps \
             ./internal/util \
             ./sdk/api/handlers \
+            ./sdk/api/handlers/claude \
             ./sdk/cliproxy \
             ./sdk/cliproxy/auth
           go test ./internal/api -run '^TestCodexOAuthRoute' -count=1

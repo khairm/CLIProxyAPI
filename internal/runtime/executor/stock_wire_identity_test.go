@@ -126,6 +126,19 @@ func patchedWireOptions() cliproxyexecutor.Options {
 	return cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
 }
 
+const patchedWireTerminalDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"par\"}\n\n"
+
+// Must match stockWireGeneratorTerminalFixtures in stock_wire_fixture_generator_test.go.
+var patchedWireTerminalFixtures = []struct{ name, sse string }{
+	{"terminal_error_event", patchedWireTerminalDelta +
+		"data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request\",\"code\":\"cyber_policy\",\"message\":\"blocked\",\"param\":null},\"sequence_number\":3}\n\n"},
+	{"terminal_response_failed", patchedWireTerminalDelta +
+		"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"blocked\"}}}\n\n"},
+	{"terminal_response_incomplete", patchedWireTerminalDelta +
+		"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"},
+	{"stream_closed_no_completed", patchedWireTerminalDelta},
+}
+
 func capturePatchedUnmarkedWire(t *testing.T) stockWireFixtureSet {
 	t.Helper()
 	cfg := patchedWireFixtureConfig()
@@ -229,6 +242,24 @@ func capturePatchedUnmarkedWire(t *testing.T) stockWireFixtureSet {
 	}
 	errorPath.Outcome = "error:" + errExecute.Error()
 	fixtures = append(fixtures, errorPath)
+
+	for _, terminal := range patchedWireTerminalFixtures {
+		var captured stockWireFixture
+		terminalRT := codexOAuthRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			var errCapture error
+			captured, errCapture = patchedWireCapture(req, terminal.name)
+			if errCapture != nil {
+				return nil, errCapture
+			}
+			return codexOAuthSSEResponse(req, terminal.sse), nil
+		})
+		_, errTerminal := NewCodexExecutor(cfg).Execute(patchedWireContext(terminal.name, terminalRT), auth, patchedWireRequest(), patchedWireOptions())
+		if errTerminal == nil {
+			t.Fatalf("Execute %s returned nil error", terminal.name)
+		}
+		captured.Outcome = "error:" + errTerminal.Error()
+		fixtures = append(fixtures, captured)
+	}
 
 	return stockWireFixtureSet{
 		StockTag:    "v7.2.62",

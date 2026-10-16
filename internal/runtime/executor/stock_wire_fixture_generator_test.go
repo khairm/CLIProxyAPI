@@ -117,6 +117,19 @@ func stockWireGeneratorOptions() cliproxyexecutor.Options {
 	return cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
 }
 
+const stockWireGeneratorTerminalDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"par\"}\n\n"
+
+// 200 streams that end without response.completed. Must match patchedWireTerminalFixtures.
+var stockWireGeneratorTerminalFixtures = []struct{ name, sse string }{
+	{"terminal_error_event", stockWireGeneratorTerminalDelta +
+		"data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request\",\"code\":\"cyber_policy\",\"message\":\"blocked\",\"param\":null},\"sequence_number\":3}\n\n"},
+	{"terminal_response_failed", stockWireGeneratorTerminalDelta +
+		"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_prompt\",\"message\":\"blocked\"}}}\n\n"},
+	{"terminal_response_incomplete", stockWireGeneratorTerminalDelta +
+		"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"},
+	{"stream_closed_no_completed", stockWireGeneratorTerminalDelta},
+}
+
 func stockWireGeneratorRun(t *testing.T) stockWireGeneratorFixtureSet {
 	t.Helper()
 	cfg := &config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}}
@@ -220,6 +233,29 @@ func stockWireGeneratorRun(t *testing.T) stockWireGeneratorFixtureSet {
 	}
 	errorPath.Outcome = "error:" + errExecute.Error()
 	fixtures = append(fixtures, errorPath)
+
+	for _, terminal := range stockWireGeneratorTerminalFixtures {
+		var captured stockWireGeneratorFixture
+		terminalRT := stockWireGeneratorRoundTripper(func(req *http.Request) (*http.Response, error) {
+			var errCapture error
+			captured, errCapture = stockWireGeneratorCapture(req, terminal.name)
+			if errCapture != nil {
+				return nil, errCapture
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(terminal.sse)),
+				Request:    req,
+			}, nil
+		})
+		_, errTerminal := NewCodexExecutor(cfg).Execute(stockWireGeneratorContext(terminal.name, terminalRT), auth, stockWireGeneratorRequest(), stockWireGeneratorOptions())
+		if errTerminal == nil {
+			t.Fatalf("Execute %s returned nil error", terminal.name)
+		}
+		captured.Outcome = "error:" + errTerminal.Error()
+		fixtures = append(fixtures, captured)
+	}
 
 	return stockWireGeneratorFixtureSet{
 		StockTag:    "v7.2.62",

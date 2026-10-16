@@ -120,6 +120,138 @@
       },
       "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
       "outcome": "error:{\"error\":{\"message\":\"fixture rate limit\",\"type\":\"rate_limit_error\"}}"
+    },
+    {
+      "name": "terminal_error_event",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "terminal_error_event"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "error:stream error: stream disconnected before completion: stream closed before response.completed"
+    },
+    {
+      "name": "terminal_response_failed",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "terminal_response_failed"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "error:stream error: stream disconnected before completion: stream closed before response.completed"
+    },
+    {
+      "name": "terminal_response_incomplete",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "terminal_response_incomplete"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "error:stream error: stream disconnected before completion: stream closed before response.completed"
+    },
+    {
+      "name": "stream_closed_no_completed",
+      "method": "POST",
+      "url": "https://chatgpt.com/backend-api/codex/responses",
+      "headers": {
+        "accept": [
+          "text/event-stream"
+        ],
+        "authorization": [
+          "Bearer oauth-token"
+        ],
+        "chatgpt-account-id": [
+          "account-1"
+        ],
+        "connection": [
+          "Keep-Alive"
+        ],
+        "content-type": [
+          "application/json"
+        ],
+        "originator": [
+          "codex-tui"
+        ],
+        "user-agent": [
+          "stock-wire-fixture/1.0"
+        ],
+        "x-client-request-id": [
+          "stream_closed_no_completed"
+        ]
+      },
+      "body": "{\"model\":\"gpt-5-codex\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true,\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"instructions\":\"\"}",
+      "outcome": "error:stream error: stream disconnected before completion: stream closed before response.completed"
     }
   ]
 }
