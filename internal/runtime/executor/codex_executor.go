@@ -938,8 +938,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			}
 			completedData = completedDataPatched
 		}
-		if eventType == "response.incomplete" {
-			completedData = codexEdgeeDropUnfinishedFunctionCalls(completedData)
+		if edgeeIncomplete && eventType == "response.incomplete" {
+			completedData = codexEdgeeFilterIncompleteFunctionCalls(completedData)
 		}
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 

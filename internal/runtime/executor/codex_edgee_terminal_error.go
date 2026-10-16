@@ -22,8 +22,7 @@ func codexEdgeeTerminalErr(eventData []byte, stored error) error {
 		if body = codexTerminalErrorBody(eventData, "response.error"); len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
 		}
-	}
-	if len(body) == 0 {
+	default:
 		return stored
 	}
 	// The body helpers fill an empty message from code, then type.
@@ -59,24 +58,28 @@ func codexEdgeeErrorClass(body []byte) (int, string) {
 	return http.StatusInternalServerError, "api_error"
 }
 
-// Edgee fork: drop function calls a response.incomplete cut off, so Claude Code never runs them.
-func codexEdgeeDropUnfinishedFunctionCalls(eventData []byte) []byte {
+// Edgee fork: response.incomplete keeps only finished function calls, and only after max_output_tokens.
+func codexEdgeeFilterIncompleteFunctionCalls(eventData []byte) []byte {
 	output := gjson.GetBytes(eventData, "response.output")
 	if !output.IsArray() {
 		return eventData
 	}
+	keepFinished := gjson.GetBytes(eventData, "response.incomplete_details.reason").String() == "max_output_tokens"
 	items := output.Array()
 	kept := make([]string, 0, len(items))
 	for _, item := range items {
-		if item.Get("type").String() == "function_call" &&
-			(item.Get("status").String() == "incomplete" || !gjson.Valid(item.Get("arguments").String())) {
-			continue
+		if item.Get("type").String() != "function_call" || (keepFinished && codexEdgeeFunctionCallFinished(item)) {
+			kept = append(kept, item.Raw)
 		}
-		kept = append(kept, item.Raw)
 	}
 	if len(kept) == len(items) {
 		return eventData
 	}
 	out, _ := sjson.SetRawBytes(eventData, "response.output", rawJSONArray(kept))
 	return out
+}
+
+func codexEdgeeFunctionCallFinished(item gjson.Result) bool {
+	status := item.Get("status")
+	return (!status.Exists() || status.String() == "completed") && gjson.Valid(item.Get("arguments").String())
 }
