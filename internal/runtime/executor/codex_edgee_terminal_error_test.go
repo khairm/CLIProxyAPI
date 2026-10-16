@@ -15,16 +15,26 @@ const (
 	edgeeTerminalCyberMessage = "This request was blocked by our safety systems. Reason: Potentially unintended activity."
 	edgeeTerminalCyberEvent   = `{"type":"error","error":{"type":"invalid_request","code":"cyber_policy","message":"` + edgeeTerminalCyberMessage + `","param":null},"sequence_number":3}`
 	edgeeTerminalEmptyFailed  = `{"type":"response.failed","response":{"error":{}}}`
-	edgeeTerminalPartialDone  = `{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}`
+	edgeeTerminalPartialItem  = `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}`
+	edgeeTerminalPartialDone  = `{"type":"response.output_item.done","output_index":0,"item":` + edgeeTerminalPartialItem + `}`
+	edgeeTerminalClaudeBody   = `{"model":"gpt-5-codex","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`
 )
 
 type edgeeTerminalCheck func(t *testing.T, resp cliproxyexecutor.Response, err error)
 
 func edgeeTerminalIncomplete(reason string) string {
-	return `{"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","output":[],"incomplete_details":{"reason":"` + reason + `"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+	return edgeeTerminalIncompleteWithOutput(reason, "")
+}
+
+func edgeeTerminalIncompleteWithOutput(reason, output string) string {
+	return `{"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","output":[` + output + `],"incomplete_details":{"reason":"` + reason + `"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
 }
 
 func executeEdgeeTerminalCase(routed bool, events []string) (cliproxyexecutor.Response, error) {
+	return executeEdgeeTerminalFormatCase(routed, sdktranslator.FormatClaude, edgeeTerminalClaudeBody, events)
+}
+
+func executeEdgeeTerminalFormatCase(routed bool, format sdktranslator.Format, payload string, events []string) (cliproxyexecutor.Response, error) {
 	var sse strings.Builder
 	for _, event := range append([]string{
 		`{"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","output":[]}}`,
@@ -38,8 +48,8 @@ func executeEdgeeTerminalCase(routed bool, events []string) (cliproxyexecutor.Re
 	ctx := codexOAuthExecutionContext("client-key", "edgee-terminal", routed, "", rt)
 	return NewCodexExecutor(patchedWireFixtureConfig()).Execute(ctx, patchedWireAuth(), cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+		Payload: []byte(payload),
+	}, cliproxyexecutor.Options{SourceFormat: format})
 }
 
 func edgeeTerminalWantError(wantStatus int, wantMsg string) edgeeTerminalCheck {
@@ -84,6 +94,9 @@ func edgeeTerminalWantReply(wantStop, wantText string) edgeeTerminalCheck {
 		if got := gjson.GetBytes(resp.Payload, "content.0.text").String(); got != wantText {
 			t.Fatalf("content.0.text = %q, want %q; payload=%s", got, wantText, resp.Payload)
 		}
+		if gjson.GetBytes(resp.Payload, `content.#(type=="tool_use")`).Exists() {
+			t.Fatalf("unexpected tool_use; payload=%s", resp.Payload)
+		}
 	}
 }
 
@@ -105,11 +118,17 @@ func TestCodexExecutorEdgeeTerminalErrorPassthrough(t *testing.T) {
 		{"slow_down", []string{`{"type":"error","error":{"code":"slow_down","message":"wait"}}`}, stock408, edgeeTerminalWantPassthrough(http.StatusTooManyRequests, "rate_limit_error", "wait")},
 		{"unknown code", []string{`{"type":"error","error":{"code":"server_is_overloaded","message":"busy"}}`}, stock408, edgeeTerminalWantPassthrough(http.StatusInternalServerError, "api_error", "busy")},
 		{"message only", []string{`{"type":"error","error":{"message":"edgee said no"}}`}, stock408, edgeeTerminalWantPassthrough(http.StatusInternalServerError, "api_error", "edgee said no")},
-		{"empty object", []string{edgeeTerminalEmptyFailed}, stock408, edgeeTerminalWantPassthrough(http.StatusInternalServerError, "api_error", edgeeTerminalEmptyFailed)},
+		{"empty object", []string{edgeeTerminalEmptyFailed}, stock408, edgeeTerminalWantPassthrough(http.StatusInternalServerError, "api_error", "upstream response.failed with no error details")},
 		{"error then completed", []string{edgeeTerminalCyberEvent, edgeeTerminalPartialDone, `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`}, edgeeTerminalWantReply("end_turn", "partial"), edgeeTerminalWantReply("end_turn", "partial")},
 		{"error then failed", []string{edgeeTerminalCyberEvent, `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"failed slow"}}}`}, stock408, edgeeTerminalWantPassthrough(http.StatusTooManyRequests, "rate_limit_error", "failed slow")},
+		{"error then failed without details", []string{edgeeTerminalCyberEvent, `{"type":"response.failed","response":{"error":null}}`}, stock408, edgeeTerminalWantPassthrough(http.StatusBadRequest, "invalid_request_error", edgeeTerminalCyberMessage)},
+		{"error then incomplete", []string{edgeeTerminalCyberEvent, edgeeTerminalPartialDone, edgeeTerminalIncomplete("content_filter")}, stock408, edgeeTerminalWantReply("refusal", "partial")},
 		{"incomplete filter", []string{edgeeTerminalPartialDone, edgeeTerminalIncomplete("content_filter")}, stock408, edgeeTerminalWantReply("refusal", "partial")},
 		{"incomplete length", []string{edgeeTerminalPartialDone, edgeeTerminalIncomplete("max_output_tokens")}, stock408, edgeeTerminalWantReply("max_tokens", "partial")},
+		{"incomplete populated output", []string{edgeeTerminalIncompleteWithOutput("max_output_tokens", edgeeTerminalPartialItem)}, stock408, edgeeTerminalWantReply("max_tokens", "partial")},
+		{"incomplete truncated function_call", []string{edgeeTerminalIncompleteWithOutput("max_output_tokens", edgeeTerminalPartialItem+
+			`,{"type":"function_call","status":"incomplete","call_id":"call_1","name":"Bash","arguments":"{\"command\":\"ls\"}"}`+
+			`,{"type":"function_call","call_id":"call_2","name":"Bash","arguments":"{\"command\":\"rm -"}`)}, stock408, edgeeTerminalWantReply("max_tokens", "partial")},
 		{"stock context length", []string{`{"type":"error","error":{"code":"context_length_exceeded","message":"too long"}}`}, contextLength, contextLength},
 		{"no terminal event", nil, stock408, stock408},
 	}
@@ -121,4 +140,12 @@ func TestCodexExecutorEdgeeTerminalErrorPassthrough(t *testing.T) {
 			tc.marked(t, resp, err)
 		})
 	}
+
+	t.Run("non-claude incomplete", func(t *testing.T) {
+		events := []string{edgeeTerminalPartialDone, edgeeTerminalIncomplete("max_output_tokens")}
+		for _, routed := range []bool{false, true} {
+			resp, err := executeEdgeeTerminalFormatCase(routed, sdktranslator.FormatOpenAIResponse, `{"model":"gpt-5-codex","input":"hello"}`, events)
+			stock408(t, resp, err)
+		}
+	})
 }

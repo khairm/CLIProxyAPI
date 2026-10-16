@@ -9,9 +9,11 @@ import (
 )
 
 // Edgee fork: Edgee-routed Execute returns the real terminal upstream error instead of stock's 408.
-func codexEdgeeTerminalErr(eventData []byte) (statusErr, bool) {
+// It returns the error to keep; a detail-free event never replaces a stored error.
+func codexEdgeeTerminalErr(eventData []byte, stored error) error {
+	eventType := gjson.GetBytes(eventData, "type").String()
 	var body []byte
-	switch gjson.GetBytes(eventData, "type").String() {
+	switch eventType {
 	case "error":
 		if body = codexTerminalErrorBody(eventData, "error"); len(body) == 0 {
 			body = codexTerminalTopLevelErrorBody(eventData)
@@ -22,16 +24,20 @@ func codexEdgeeTerminalErr(eventData []byte) (statusErr, bool) {
 		}
 	}
 	if len(body) == 0 {
-		return statusErr{}, false
+		return stored
 	}
-	status, anthropicType := codexEdgeeErrorClass(body)
+	// The body helpers fill an empty message from code, then type.
 	message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
 	if message == "" {
-		message = string(eventData)
+		if stored != nil {
+			return stored
+		}
+		message = "upstream " + eventType + " with no error details"
 	}
+	status, anthropicType := codexEdgeeErrorClass(body)
 	out, _ := sjson.SetBytes([]byte(`{"error":{}}`), "error.type", anthropicType)
 	out, _ = sjson.SetBytes(out, "error.message", message)
-	return statusErr{code: status, msg: string(out)}, true
+	return statusErr{code: status, msg: string(out)}
 }
 
 // Code first, then type, else 500.
@@ -51,4 +57,26 @@ func codexEdgeeErrorClass(body []byte) (int, string) {
 		return http.StatusTooManyRequests, "rate_limit_error"
 	}
 	return http.StatusInternalServerError, "api_error"
+}
+
+// Edgee fork: drop function calls a response.incomplete cut off, so Claude Code never runs them.
+func codexEdgeeDropUnfinishedFunctionCalls(eventData []byte) []byte {
+	output := gjson.GetBytes(eventData, "response.output")
+	if !output.IsArray() {
+		return eventData
+	}
+	items := output.Array()
+	kept := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Get("type").String() == "function_call" &&
+			(item.Get("status").String() == "incomplete" || !gjson.Valid(item.Get("arguments").String())) {
+			continue
+		}
+		kept = append(kept, item.Raw)
+	}
+	if len(kept) == len(items) {
+		return eventData
+	}
+	out, _ := sjson.SetRawBytes(eventData, "response.output", rawJSONArray(kept))
+	return out
 }

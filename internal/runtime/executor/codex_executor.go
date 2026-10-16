@@ -871,6 +871,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	edgeeRouted := e.usesConfiguredOAuthBaseURL(ctx, auth)
+	edgeeIncomplete := edgeeRouted && sourceFormatEqual(responseFormat, sdktranslator.FormatClaude)
 	var edgeeErr error
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
@@ -889,10 +890,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		if edgeeRouted {
-			if passErr, ok := codexEdgeeTerminalErr(eventData); ok {
-				edgeeErr = passErr // last wins: response.failed beats an earlier error
-				continue
-			}
+			edgeeErr = codexEdgeeTerminalErr(eventData, edgeeErr)
 		}
 
 		if eventType == "response.output_item.done" {
@@ -909,7 +907,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 
-		if eventType != "response.completed" && !(edgeeRouted && eventType == "response.incomplete") {
+		if eventType != "response.completed" && !(edgeeIncomplete && eventType == "response.incomplete") {
 			continue
 		}
 
@@ -939,6 +937,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
 			}
 			completedData = completedDataPatched
+		}
+		if eventType == "response.incomplete" {
+			completedData = codexEdgeeDropUnfinishedFunctionCalls(completedData)
 		}
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
