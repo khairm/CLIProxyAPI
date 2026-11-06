@@ -39,6 +39,21 @@ func TestParse(t *testing.T) {
 		{name: "socks5", input: "socks5://proxy.example.com:1080", want: ModeProxy},
 		{name: "socks5h", input: "socks5h://proxy.example.com:1080", want: ModeProxy},
 		{name: "invalid", input: "bad-value", want: ModeInvalid, wantErr: true},
+		{name: "direct any case padded", input: "  DIRECT ", want: ModeDirect},
+		{name: "none any case", input: "None", want: ModeDirect},
+		{name: "http without port", input: "http://proxy.example.com", want: ModeProxy},
+		{name: "empty hostname", input: "http://:8080", want: ModeInvalid, wantErr: true},
+		{name: "empty socks hostname", input: "socks5://:1080", want: ModeInvalid, wantErr: true},
+		{name: "empty port", input: "http://proxy.example.com:", want: ModeInvalid, wantErr: true},
+		{name: "port zero", input: "http://proxy.example.com:0", want: ModeInvalid, wantErr: true},
+		{name: "port too large", input: "http://127.0.0.1:65536", want: ModeInvalid, wantErr: true},
+		{name: "ipv6 port too large", input: "https://[::1]:99999", want: ModeInvalid, wantErr: true},
+		{name: "socks5 without port", input: "socks5://proxy.example.com", want: ModeInvalid, wantErr: true},
+		{name: "socks5h port too large", input: "socks5h://proxy.example.com:99999", want: ModeInvalid, wantErr: true},
+		{name: "socks5 extra port", input: "socks5://localhost:1080:80", want: ModeInvalid, wantErr: true},
+		{name: "http extra port", input: "http://proxy.example.com:8080:80", want: ModeInvalid, wantErr: true},
+		{name: "ipv6 with port", input: "socks5://[::1]:1080", want: ModeProxy},
+		{name: "ipv6 without port", input: "http://[::1]", want: ModeProxy},
 	}
 
 	for _, tt := range tests {

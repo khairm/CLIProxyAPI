@@ -1059,12 +1059,25 @@ func contextWithGinHeaders(headers map[string]string) context.Context {
 func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	t.Parallel()
 
-	dialer := newProxyAwareWebsocketDialer(
+	dialer, err := newProxyAwareWebsocketDialer(
 		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
 		&cliproxyauth.Auth{ProxyURL: "direct"},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestNewProxyAwareWebsocketDialerRejectsInvalidProxy(t *testing.T) {
+	t.Parallel()
+
+	for _, proxyURL := range []string{"ftp://proxy.example.com:21", "http://"} {
+		if _, err := newProxyAwareWebsocketDialer(nil, &cliproxyauth.Auth{ProxyURL: proxyURL}); err == nil {
+			t.Fatalf("proxy %q: expected an error, got a dialer", proxyURL)
+		}
 	}
 }

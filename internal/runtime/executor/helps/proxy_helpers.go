@@ -2,14 +2,15 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
@@ -32,9 +33,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
+	var proxyURL, authID string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		authID = auth.ID
 	}
 
 	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
@@ -42,15 +44,9 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
-		if transport != nil {
-			httpClient.Transport = transport
-			return httpClient
-		}
-		// If proxy setup failed, log and fall through to context RoundTripper
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyutil.Redact(proxyURL))
+		httpClient.Transport = proxyTransport(proxyURL, authID)
+		return httpClient
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -61,19 +57,29 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	return httpClient
 }
 
-// buildProxyTransport creates an HTTP transport configured for the given proxy URL.
-// It supports SOCKS5, HTTP, and HTTPS proxy protocols.
-//
-// Parameters:
-//   - proxyURL: The proxy URL string (e.g., "socks5://user:pass@host:port", "http://host:port")
-//
-// Returns:
-//   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
-func buildProxyTransport(proxyURL string) *http.Transport {
+// One transport per proxy and account for the whole process, so connections are pooled across
+// clients but never shared between accounts. Entries are never evicted; idle connections close.
+var (
+	sharedProxyMu         sync.Mutex
+	sharedProxyTransports = map[transportKey]*http.Transport{}
+)
+
+// proxyTransport returns the shared transport for proxyURL (SOCKS5, HTTP, HTTPS or "direct").
+// An invalid proxy URL yields a transport that fails every request.
+func proxyTransport(proxyURL, authID string) http.RoundTripper {
+	key, errKey := newTransportKey(proxyURL, authID)
+	if errKey != nil {
+		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errKey))
+	}
+	sharedProxyMu.Lock()
+	defer sharedProxyMu.Unlock()
+	if transport, ok := sharedProxyTransports[key]; ok {
+		return transport
+	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
-		log.Errorf("%v", errBuild)
-		return nil
+		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errBuild))
 	}
+	sharedProxyTransports[key] = transport
 	return transport
 }

@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -55,20 +57,49 @@ func Parse(raw string) (Setting, error) {
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("parse proxy URL failed")
 	}
-	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+	if parsedURL.Scheme == "" || parsedURL.Hostname() == "" {
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("proxy URL missing scheme/host")
 	}
 
 	switch parsedURL.Scheme {
 	case "socks5", "socks5h", "http", "https":
-		setting.Mode = ModeProxy
-		setting.URL = parsedURL
-		return setting, nil
 	default:
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
 	}
+	if errPort := checkProxyPort(parsedURL); errPort != nil {
+		setting.Mode = ModeInvalid
+		return setting, errPort
+	}
+	setting.Mode = ModeProxy
+	setting.URL = parsedURL
+	return setting, nil
+}
+
+// checkProxyPort requires a well-formed host:port with a port in 1-65535 when a port is given,
+// and always for SOCKS5.
+func checkProxyPort(u *url.URL) error {
+	if u.Port() == "" && !strings.HasSuffix(u.Host, ":") {
+		if u.Scheme == "socks5" || u.Scheme == "socks5h" {
+			return fmt.Errorf("SOCKS5 proxy URL needs a port")
+		}
+		return nil
+	}
+	host, port, errSplit := net.SplitHostPort(u.Host)
+	if errSplit != nil {
+		return fmt.Errorf("proxy URL host and port are malformed")
+	}
+	if host == "" {
+		return fmt.Errorf("proxy URL missing scheme/host")
+	}
+	if port == "" {
+		return fmt.Errorf("proxy URL has an empty port")
+	}
+	if n, errAtoi := strconv.Atoi(port); errAtoi != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("proxy URL port %q is out of range", port)
+	}
+	return nil
 }
 
 func cloneDefaultTransport() *http.Transport {
@@ -152,22 +183,43 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 
 type httpConnectDialer struct {
 	proxyURL *url.URL
-	dialer   proxy.Dialer
+	dialer   proxy.ContextDialer
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	proxyConn, errDial := d.dialer.Dial(network, proxyDialAddr(d.proxyURL))
+	return d.DialContext(context.Background(), network, addr)
+}
+
+// DialContext dials through the proxy; ctx bounds the proxy dial, its TLS handshake and the CONNECT exchange.
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	proxyConn, errDial := d.dialer.DialContext(ctx, network, proxyDialAddr(d.proxyURL))
 	if errDial != nil {
 		return nil, fmt.Errorf("dial HTTP proxy failed: %w", errDial)
 	}
 
+	conn, errConnect := d.connect(ctx, proxyConn, addr)
+	if errConnect != nil {
+		if errClose := proxyConn.Close(); errClose != nil {
+			return nil, fmt.Errorf("%w; close failed: %v", errConnect, errClose)
+		}
+		return nil, errConnect
+	}
+	return conn, nil
+}
+
+func (d *httpConnectDialer) connect(ctx context.Context, proxyConn net.Conn, addr string) (net.Conn, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if errDeadline := proxyConn.SetDeadline(deadline); errDeadline != nil {
+			return nil, fmt.Errorf("set proxy deadline failed: %w", errDeadline)
+		}
+	}
+	stop := context.AfterFunc(ctx, func() { _ = proxyConn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
 	conn := proxyConn
 	if d.proxyURL.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
-		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-			if errClose := conn.Close(); errClose != nil {
-				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)
-			}
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
 			return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
 		}
 		conn = tlsConn
@@ -183,34 +235,42 @@ func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
 		req.Header.Set("Proxy-Authorization", proxyAuthorization(d.proxyURL.User))
 	}
 	if errWrite := req.Write(conn); errWrite != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("write CONNECT request failed: %w; close failed: %v", errWrite, errClose)
-		}
-		return nil, fmt.Errorf("write CONNECT request failed: %w", errWrite)
+		return nil, fmt.Errorf("write CONNECT request failed: %w", contextError(ctx, errWrite))
 	}
 
 	reader := bufio.NewReader(conn)
 	resp, errRead := http.ReadResponse(reader, req)
 	if errRead != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("read CONNECT response failed: %w; close failed: %v", errRead, errClose)
-		}
-		return nil, fmt.Errorf("read CONNECT response failed: %w", errRead)
+		return nil, fmt.Errorf("read CONNECT response failed: %w", contextError(ctx, errRead))
 	}
-	if resp.StatusCode != http.StatusOK {
-		if resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("proxy CONNECT returned status %s; close failed: %v", resp.Status, errClose)
-		}
+	// RFC 9110 9.3.6: a 2xx CONNECT reply has no body, so never read resp.Body; bytes after the headers belong to the tunnel.
+	// A rejected CONNECT is not drained: the caller closes the socket.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("proxy CONNECT returned status %s", resp.Status)
 	}
 
+	if !stop() {
+		return nil, ctx.Err()
+	}
+	if errDeadline := proxyConn.SetDeadline(time.Time{}); errDeadline != nil {
+		return nil, fmt.Errorf("clear proxy deadline failed: %w", errDeadline)
+	}
 	if reader.Buffered() > 0 {
 		return &bufferedConn{Conn: conn, reader: reader}, nil
 	}
 	return conn, nil
+}
+
+// contextError prefers the context's error when the I/O failed because ctx ended.
+// The conn deadline can fire just before ctx records its own expiry, so a passed deadline counts too.
+func contextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func proxyDialAddr(proxyURL *url.URL) string {
@@ -263,4 +323,17 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 		return c.reader.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+// FailingTransport returns a RoundTripper that fails every request with err, for a proxy
+// setting that cannot be used; it closes the request body as the RoundTripper contract requires.
+func FailingTransport(err error) http.RoundTripper { return failingTransport{err: err} }
+
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return nil, f.err
 }

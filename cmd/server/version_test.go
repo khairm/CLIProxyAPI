@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestEmbeddedVersion(t *testing.T) {
-	if Version != "7.2.62+edgee.7" {
-		t.Fatalf("Version = %q, want 7.2.62+edgee.7", Version)
+	if Version != "7.2.62+edgee.8" {
+		t.Fatalf("Version = %q, want 7.2.62+edgee.8", Version)
 	}
 }

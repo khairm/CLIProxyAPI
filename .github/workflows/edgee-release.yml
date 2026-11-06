@@ -28,6 +28,7 @@ jobs:
           set -euo pipefail
           go test \
             ./cmd/server \
+            ./internal/auth/claude \
             ./internal/config \
             ./internal/logging \
             ./internal/runtime/executor \
@@ -36,7 +37,8 @@ jobs:
             ./sdk/api/handlers \
             ./sdk/api/handlers/claude \
             ./sdk/cliproxy \
-            ./sdk/cliproxy/auth
+            ./sdk/cliproxy/auth \
+            ./sdk/proxyutil
           go test ./internal/api -run '^TestCodexOAuthRoute' -count=1
       - name: Race-test concurrency and route isolation
         run: >-
@@ -46,6 +48,14 @@ jobs:
           ./internal/api/handlers/management
           ./internal/runtime/executor
           ./sdk/cliproxy/auth
+      - name: Race-test shared proxy connections
+        run: >-
+          go test -race -count=1
+          -run 'Test(UtlsClient|InvalidProxyURL|ClientsForTheSameProxy|Connect|RetryBackoff|ReviewNotEstablishedConnIsReused|EquivalentProxySettings|NewClaudeAuth|PatchAuthFileFields|ConfigHandlersRejectInvalidProxyURL|UploadAuthFileRejectsBadProxyURL)'
+          ./internal/api/handlers/management
+          ./internal/auth/claude
+          ./internal/runtime/executor/helps
+          ./sdk/proxyutil
 
   build-windows-arm64:
     needs: test-gate

@@ -154,6 +154,12 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 // NewClaudeAuthWithProxyURL creates a new Anthropic authentication service with a proxy override.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth {
+	return NewClaudeAuthForAccount(cfg, proxyURL, "")
+}
+
+// NewClaudeAuthForAccount is NewClaudeAuthWithProxyURL for the account authID, whose
+// requests use that account's own shared connection.
+func NewClaudeAuthForAccount(cfg *config.Config, proxyURL, authID string) *ClaudeAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
 	var sdkCfg *config.SDKConfig
 	if cfg != nil {
@@ -171,7 +177,7 @@ func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth 
 	// Use custom HTTP client with Firefox TLS fingerprint to bypass
 	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
-		httpClient: NewAnthropicHttpClient(sdkCfg),
+		httpClient: NewAnthropicHttpClient(sdkCfg, authID),
 	}
 }
 

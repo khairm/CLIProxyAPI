@@ -139,6 +139,9 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	if rejectInvalidProxyURLs(c, &config.Config{GeminiKey: arr}) {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
@@ -204,6 +207,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
+		if rejectInvalidProxyURL(c, "proxy-url", *body.Value.ProxyURL) {
+			return
+		}
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Headers != nil {
@@ -298,6 +304,9 @@ func (h *Handler) PutInteractionsKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	if rejectInvalidProxyURLs(c, &config.Config{InteractionsKey: arr}) {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.cfg.InteractionsKey = append([]config.GeminiKey(nil), arr...)
@@ -364,6 +373,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
+		if rejectInvalidProxyURL(c, "proxy-url", *body.Value.ProxyURL) {
+			return
+		}
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Headers != nil {
@@ -457,6 +469,9 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	if rejectInvalidProxyURLs(c, &config.Config{ClaudeKey: arr}) {
+		return
+	}
 	for i := range arr {
 		normalizeClaudeKey(&arr[i])
 	}
@@ -518,6 +533,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
 	if body.Value.ProxyURL != nil {
+		if rejectInvalidProxyURL(c, "proxy-url", *body.Value.ProxyURL) {
+			return
+		}
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Models != nil {
@@ -612,6 +630,9 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	if rejectInvalidProxyURLs(c, &config.Config{OpenAICompatibility: arr}) {
+		return
+	}
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
 	for i := range arr {
 		normalizeOpenAICompatibilityEntry(&arr[i])
@@ -690,6 +711,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		entry.BaseURL = trimmed
 	}
 	if body.Value.APIKeyEntries != nil {
+		if rejectInvalidProxyURLs(c, &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{APIKeyEntries: *body.Value.APIKeyEntries}}}) {
+			return
+		}
 		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
 	}
 	if body.Value.Models != nil {
@@ -752,6 +776,9 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 			return
 		}
 		arr = obj.Items
+	}
+	if rejectInvalidProxyURLs(c, &config.Config{VertexCompatAPIKey: arr}) {
+		return
 	}
 	for i := range arr {
 		normalizeVertexCompatKey(&arr[i])
@@ -833,6 +860,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		entry.BaseURL = trimmed
 	}
 	if body.Value.ProxyURL != nil {
+		if rejectInvalidProxyURL(c, "proxy-url", *body.Value.ProxyURL) {
+			return
+		}
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Headers != nil {
@@ -1106,6 +1136,9 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	if rejectInvalidProxyURLs(c, &config.Config{CodexKey: arr}) {
+		return
+	}
 	// Filter out codex entries with empty base-url (treat as removed)
 	filtered := make([]config.CodexKey, 0, len(arr))
 	for i := range arr {
@@ -1180,6 +1213,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		entry.BaseURL = trimmed
 	}
 	if body.Value.ProxyURL != nil {
+		if rejectInvalidProxyURL(c, "proxy-url", *body.Value.ProxyURL) {
+			return
+		}
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Models != nil {
@@ -1380,4 +1416,22 @@ func sanitizedOAuthModelAlias(entries map[string][]config.OAuthModelAlias) map[s
 		return nil
 	}
 	return cfg.OAuthModelAlias
+}
+
+// rejectInvalidProxyURLs answers 400 and returns true when any proxy-url in candidate is malformed.
+func rejectInvalidProxyURLs(c *gin.Context, candidate *config.Config) bool {
+	if err := candidate.ValidateProxyURLs(); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return true
+	}
+	return false
+}
+
+// rejectInvalidProxyURL answers 400 and returns true when raw is not a usable proxy setting.
+func rejectInvalidProxyURL(c *gin.Context, field, raw string) bool {
+	if err := config.ValidateProxyURL(field, raw); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return true
+	}
+	return false
 }
