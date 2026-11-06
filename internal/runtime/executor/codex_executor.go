@@ -1236,7 +1236,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 func markCodexResponseComplete(body io.ReadCloser, data []byte) {
 	switch gjson.GetBytes(data, "type").String() {
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.incomplete", "response.failed", "error":
 		helps.MarkResponseComplete(body)
 	}
 }

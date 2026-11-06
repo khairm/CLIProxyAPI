@@ -54,6 +54,7 @@ jobs:
           -run 'Test(UtlsClient|InvalidProxyURL|ClientsForTheSameProxy|Connect|RetryBackoff|ReviewNotEstablishedConnIsReused|EquivalentProxySettings|NewClaudeAuth|PatchAuthFileFields|ConfigHandlersRejectInvalidProxyURL|UploadAuthFileRejectsBadProxyURL)'
           ./internal/api/handlers/management
           ./internal/auth/claude
+          ./internal/runtime/executor
           ./internal/runtime/executor/helps
           ./sdk/proxyutil
 

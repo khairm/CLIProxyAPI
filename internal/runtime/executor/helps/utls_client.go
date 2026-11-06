@@ -39,6 +39,14 @@ var (
 	utlsTestRootCAs *x509.CertPool
 )
 
+// SetUtlsRootCAsForTest makes pools created afterwards trust roots; tests outside this
+// package use it to reach a local TLS server. nil restores the system roots.
+func SetUtlsRootCAsForTest(roots *x509.CertPool) {
+	sharedUtlsMu.Lock()
+	utlsTestRootCAs = roots
+	sharedUtlsMu.Unlock()
+}
+
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
 // proxyURL ("" dials directly) used without an account, such as login flows.
 // An invalid proxy URL yields a transport that fails every request.
