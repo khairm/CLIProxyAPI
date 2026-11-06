@@ -6015,7 +6015,24 @@ func authAccessToken(auth *Auth) string {
 	return authMetadataString(auth, "accessToken")
 }
 
+// pilotSentinelRefreshToken is the placeholder refresh token that account-pilot and
+// the PC gateway write in place of the Pi's real one.
+const pilotSentinelRefreshToken = "managed-by-usage-display-tray"
+
+// authRefreshedExternally reports a credential that is kept fresh from the Pi.
+// Refreshing it here can only fail and mark the auth unauthorized.
+func authRefreshedExternally(auth *Auth) bool {
+	if authMetadataString(auth, "trayManagedAccount") != "" {
+		return true
+	}
+	return authMetadataString(auth, "refresh_token") == pilotSentinelRefreshToken ||
+		authMetadataString(auth, "refreshToken") == pilotSentinelRefreshToken
+}
+
 func authHasRefreshCredential(auth *Auth) bool {
+	if authRefreshedExternally(auth) {
+		return false
+	}
 	if authMetadataString(auth, "refresh_token") != "" {
 		return true
 	}
