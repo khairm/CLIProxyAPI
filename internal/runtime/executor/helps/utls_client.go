@@ -152,7 +152,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			body.Close()
 			return nil, err
 		}
-		if h := testHooks.Load(); h != nil {
+		if h := testHooks.Load(); h != nil && h.afterReserve != nil {
 			h.afterReserve(req)
 		}
 		release := conn.track(req.Context())
@@ -388,7 +388,7 @@ func (c *utlsPooledConn) retire() {
 // close drops the socket at once; Shutdown would wait behind a writer stuck on a full send buffer.
 func (c *utlsPooledConn) close() {
 	c.closeOnce.Do(func() {
-		if h := testHooks.Load(); h != nil {
+		if h := testHooks.Load(); h != nil && h.beforeRetiredClose != nil {
 			h.beforeRetiredClose()
 		}
 		_ = c.cc.Close()
