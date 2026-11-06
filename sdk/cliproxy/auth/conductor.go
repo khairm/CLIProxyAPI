@@ -2197,8 +2197,12 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("persist registered auth %s: %w", auth.ID, errPersist)
 	}
+	proxyChanged := proxyURLChanged(m.auths[auth.ID], persistAuth)
 	m.auths[auth.ID] = persistAuth
 	m.mu.Unlock()
+	if proxyChanged {
+		notifyAuthReleased(auth.ID)
+	}
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -2252,8 +2256,12 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("persist updated auth %s: %w", auth.ID, errPersist)
 	}
+	proxyChanged := proxyURLChanged(existing, persistAuth)
 	m.auths[auth.ID] = persistAuth
 	m.mu.Unlock()
+	if proxyChanged {
+		notifyAuthReleased(auth.ID)
+	}
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -2304,6 +2312,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		}
 	}
 	m.mu.Unlock()
+	notifyAuthReleased(id)
 
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()

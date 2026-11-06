@@ -23,3 +23,19 @@ func TestNewClaudeAuthWithProxyURL_OverrideProxyAppliedWithoutConfig(t *testing.
 		t.Fatalf("expected the socks5 utls transport, got %T", auth.httpClient.Transport)
 	}
 }
+
+func TestNewClaudeAuthForAccount_UsesTheAccountsOwnTransport(t *testing.T) {
+	const proxyURL = "http://proxy.example.com:8080"
+	a := NewClaudeAuthForAccount(nil, proxyURL, "account-a").httpClient.Transport
+	b := NewClaudeAuthForAccount(nil, proxyURL, "account-b").httpClient.Transport
+
+	if a == b {
+		t.Fatal("two accounts' token refreshes share one transport")
+	}
+	if a != helps.UtlsTransportForAuth(proxyURL, "account-a") {
+		t.Fatal("refresh client is not the account's shared transport")
+	}
+	if a == helps.UtlsTransport(proxyURL) {
+		t.Fatal("refresh client uses the account-less login transport")
+	}
+}

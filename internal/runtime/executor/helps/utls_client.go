@@ -29,7 +29,7 @@ const utlsDialTimeout = 30 * time.Second
 
 // One HTTP/2 transport per proxy and account for the whole process, so requests share
 // connections instead of leaving one idle tunnel per request, and accounts never share one.
-// Proxy URLs and accounts come from config, so the map is not evicted.
+// releaseAccountTransports drops an account's entries when it is removed or its proxy changes.
 var (
 	sharedUtlsMu         sync.Mutex
 	sharedUtlsTransports = map[transportKey]*utlsRoundTripper{}
@@ -37,11 +37,53 @@ var (
 	utlsTestRootCAs *x509.CertPool
 )
 
+func init() {
+	cliproxyauth.OnAuthReleased(releaseAccountTransports)
+}
+
+// releaseAccountTransports forgets every shared transport of authID and shuts down their
+// connections once their open streams finish. The account-less ("") transports stay.
+func releaseAccountTransports(authID string) {
+	if authID == "" {
+		return
+	}
+	var pools []*utlsConnPool
+	sharedUtlsMu.Lock()
+	for key, rt := range sharedUtlsTransports {
+		if key.authID == authID {
+			pools = append(pools, rt.pool)
+			delete(sharedUtlsTransports, key)
+		}
+	}
+	sharedUtlsMu.Unlock()
+	for _, pool := range pools {
+		pool.closeAll()
+	}
+
+	var transports []*http.Transport
+	sharedProxyMu.Lock()
+	for key, transport := range sharedProxyTransports {
+		if key.authID == authID {
+			transports = append(transports, transport)
+			delete(sharedProxyTransports, key)
+		}
+	}
+	sharedProxyMu.Unlock()
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
 // proxyURL ("" dials directly) used without an account, such as login flows.
 // An invalid proxy URL yields a transport that fails every request.
 func UtlsTransport(proxyURL string) http.RoundTripper {
 	return utlsTransportFor(proxyURL, "")
+}
+
+// UtlsTransportForAuth is UtlsTransport for one account, which never shares a connection with another.
+func UtlsTransportForAuth(proxyURL, authID string) http.RoundTripper {
+	return utlsTransportFor(proxyURL, authID)
 }
 
 func utlsTransportFor(proxyURL, authID string) http.RoundTripper {
@@ -75,7 +117,7 @@ func sharedUtlsTransport(proxyURL, authID string) (*utlsRoundTripper, error) {
 	// No idle or ping timeouts: AGENTS.md forbids timeouts after a connection is established.
 	h2 := &http2.Transport{ConnPool: pool}
 	pool.h2 = h2
-	rt := &utlsRoundTripper{h2: h2, pool: pool}
+	rt := &utlsRoundTripper{pool: pool}
 	sharedUtlsTransports[key] = rt
 	return rt, nil
 }
@@ -115,44 +157,58 @@ func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
 	return contextDialer, nil
 }
 
-// utlsRoundTripper wraps the shared HTTP/2 transport with what it lacks for a long-lived
-// shared connection: closing the body when no connection was obtained, dropping a
-// connection that has gone silent, and one replay of a safe request after an abrupt close.
+// utlsRoundTripper sends requests over the shared HTTP/2 connections itself, instead of through
+// http2.Transport's retry loop, so it controls which requests may be sent twice: one the server
+// confirmed it never processed is retried; any other is replayed at most once, and only when
+// it is safe to send again. It also closes the body when no connection was obtained and drops
+// a connection that has gone silent.
 type utlsRoundTripper struct {
-	h2   *http2.Transport
 	pool *utlsConnPool
 }
 
-type utlsAttemptKey struct{}
-
-// utlsAttempt records the connection the pool handed to one request attempt.
-type utlsAttempt struct {
-	conn        *utlsPooledConn
-	readAtStart uint64
-}
+// maxUnprocessedRetries bounds retries of a request the server confirmed it never processed.
+const maxUnprocessedRetries = 6
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	for replayed := false; ; replayed = true {
-		attempt := &utlsAttempt{}
-		resp, err := t.h2.RoundTrip(req.WithContext(context.WithValue(req.Context(), utlsAttemptKey{}, attempt)))
+	if req.URL.Scheme != "https" {
+		closeRequestBody(req)
+		return nil, fmt.Errorf("utls: unsupported scheme %q", req.URL.Scheme)
+	}
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
+	}
+	addr := net.JoinHostPort(req.URL.Hostname(), port)
+	replayed := false
+	for retry := 0; ; retry++ {
+		attempt, body := withOnceClosedBody(req)
+		conn, err := t.pool.reserve(req.Context(), addr)
+		if err != nil {
+			body.Close()
+			return nil, err
+		}
+		readAtStart := conn.read.Load()
+		resp, err := conn.cc.RoundTrip(attempt)
 		if err == nil {
 			return resp, nil
 		}
-		if attempt.conn == nil {
-			// No connection was obtained, so http2 never took ownership of the body.
-			if req.Body != nil {
-				_ = req.Body.Close()
-			}
-			return nil, err
-		}
+		body.Close()
 		if req.Context().Err() != nil {
-			t.pool.dropIfSilent(attempt)
+			t.pool.dropIfSilent(conn, readAtStart)
 			return nil, err
 		}
-		if replayed || !isAbruptClose(err) {
+		if err.Error() == errTextConnNotEstablished {
+			t.pool.MarkDead(conn.cc)
 			return nil, err
 		}
-		next, ok := replayableRequest(req)
+		switch {
+		case serverDidNotProcess(err) && retry < maxUnprocessedRetries:
+		case !replayed && mayHaveBeenProcessed(err) && safeToSendTwice(req):
+			replayed = true
+		default:
+			return nil, err
+		}
+		next, ok := rewoundRequest(req)
 		if !ok {
 			return nil, err
 		}
@@ -160,21 +216,45 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 }
 
-// isAbruptClose reports a connection that ended without a GOAWAY before the response headers.
-func isAbruptClose(err error) bool {
-	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+// http2 does not export these errors; they are matched by text.
+const (
+	errTextConnUnusable       = "http2: client conn not usable"
+	errTextConnGotGoAway      = "http2: Transport received Server's graceful shutdown GOAWAY"
+	errTextConnNotEstablished = "http2: client conn could not be established"
+)
+
+// serverDidNotProcess reports an error after which the server cannot have acted on the request:
+// the connection was unusable before the stream opened, the stream was above the GOAWAY's last
+// stream id, or the server refused the stream.
+func serverDidNotProcess(err error) bool {
+	if text := err.Error(); text == errTextConnUnusable || text == errTextConnGotGoAway {
+		return true
+	}
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeRefusedStream
 }
 
-// replayableRequest returns a fresh copy of req when it is safe to send again: an idempotent
-// method (or an idempotency key, as net/http allows) and a body that can be rewound.
-func replayableRequest(req *http.Request) (*http.Request, bool) {
+// mayHaveBeenProcessed reports a failure that is often transient but leaves unknown whether the
+// server acted on the request: an abrupt close before the response, or a peer PROTOCOL_ERROR.
+func mayHaveBeenProcessed(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeProtocol
+}
+
+// safeToSendTwice reports an idempotent method, or an idempotency key as net/http allows.
+func safeToSendTwice(req *http.Request) bool {
 	switch req.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-	default:
-		if req.Header.Get("Idempotency-Key") == "" && req.Header.Get("X-Idempotency-Key") == "" {
-			return nil, false
-		}
+		return true
 	}
+	return req.Header.Get("Idempotency-Key") != "" || req.Header.Get("X-Idempotency-Key") != ""
+}
+
+// rewoundRequest returns a copy of req with its body back at the start, when that is possible.
+func rewoundRequest(req *http.Request) (*http.Request, bool) {
 	next := req.Clone(req.Context())
 	if req.Body == nil || req.Body == http.NoBody {
 		return next, true
@@ -188,6 +268,39 @@ func replayableRequest(req *http.Request) (*http.Request, bool) {
 	}
 	next.Body = body
 	return next, true
+}
+
+// onceClosedBody lets both http2 and the round tripper close an attempt's body, closing it once.
+type onceClosedBody struct {
+	io.ReadCloser
+	once sync.Once
+}
+
+func (b *onceClosedBody) Close() error {
+	var err error
+	b.once.Do(func() { err = b.ReadCloser.Close() })
+	return err
+}
+
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }
+
+// withOnceClosedBody returns the request to send for one attempt and the closer for its body.
+func withOnceClosedBody(req *http.Request) (*http.Request, io.Closer) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return req, noopCloser{}
+	}
+	body := &onceClosedBody{ReadCloser: req.Body}
+	attempt := *req
+	attempt.Body = body
+	return &attempt, body
+}
+
+func closeRequestBody(req *http.Request) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
 }
 
 // utlsConnPool is an http2.ClientConnPool that dials once per address and lets
@@ -225,24 +338,22 @@ type utlsDial struct {
 	err  error
 }
 
+// GetClientConn serves http2's own use of the pool; utlsRoundTripper calls reserve directly.
 func (p *utlsConnPool) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
-	attempt, _ := req.Context().Value(utlsAttemptKey{}).(*utlsAttempt)
-	if attempt != nil {
-		attempt.conn = nil
-	}
-	conn, err := p.reserve(req, addr)
+	conn, err := p.reserve(req.Context(), addr)
 	if err != nil {
 		return nil, err
-	}
-	if attempt != nil {
-		attempt.conn = conn
-		attempt.readAtStart = conn.read.Load()
 	}
 	return conn.cc, nil
 }
 
-func (p *utlsConnPool) reserve(req *http.Request, addr string) (*utlsPooledConn, error) {
+// reserve returns a shared connection with a stream reserved for one request, dialling one
+// when none can take it. A request whose context has already ended reserves nothing.
+func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledConn, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p.mu.Lock()
 		for _, conn := range p.conns[addr] {
 			if conn.cc.ReserveNewRequest() {
@@ -260,13 +371,13 @@ func (p *utlsConnPool) reserve(req *http.Request, addr string) (*utlsPooledConn,
 
 		select {
 		case <-d.done:
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 		if d.err != nil {
 			return nil, d.err
 		}
-		if d.conn.cc.ReserveNewRequest() {
+		if ctx.Err() == nil && d.conn.cc.ReserveNewRequest() {
 			return d.conn, nil
 		}
 	}
@@ -287,16 +398,30 @@ func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
 	}
 }
 
-// dropIfSilent retires the attempt's connection when the request's context ended and the
-// connection received nothing at all meanwhile: the tunnel is dead, so new requests must
-// dial a fresh one. Shutdown lets any other streams on it finish, then closes it.
-func (p *utlsConnPool) dropIfSilent(attempt *utlsAttempt) {
-	if attempt.conn.read.Load() != attempt.readAtStart {
+// dropIfSilent retires conn when a request sent on it ended with its context and the connection
+// received nothing at all meanwhile: the tunnel is dead, so new requests must dial a fresh one.
+// A quick cancel on a quiet but healthy connection therefore costs one redial.
+// Shutdown lets any other streams on it finish, then closes it.
+func (p *utlsConnPool) dropIfSilent(conn *utlsPooledConn, readAtStart uint64) {
+	if conn.read.Load() != readAtStart {
 		return
 	}
-	cc := attempt.conn.cc
-	p.MarkDead(cc)
-	go func() { _ = cc.Shutdown(context.Background()) }()
+	p.MarkDead(conn.cc)
+	go func() { _ = conn.cc.Shutdown(context.Background()) }()
+}
+
+// closeAll forgets every connection and shuts each down once its streams finish.
+func (p *utlsConnPool) closeAll() {
+	p.mu.Lock()
+	var conns []*utlsPooledConn
+	for _, list := range p.conns {
+		conns = append(conns, list...)
+	}
+	p.conns = map[string][]*utlsPooledConn{}
+	p.mu.Unlock()
+	for _, conn := range conns {
+		go func() { _ = conn.cc.Shutdown(context.Background()) }()
+	}
 }
 
 // dial runs detached from any one request, so a cancelled first caller does not fail the others.

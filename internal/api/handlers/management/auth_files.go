@@ -1725,9 +1725,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 		}
 	}
 	if _, ok := touchedRoots["proxy_url"]; ok {
-		if proxyURL, okString := auth.Metadata["proxy_url"].(string); okString {
-			auth.ProxyURL = strings.TrimSpace(proxyURL)
-		}
+		// A null or removed proxy_url clears the live setting, matching the saved file.
+		proxyURL, _ := auth.Metadata["proxy_url"].(string)
+		auth.ProxyURL = strings.TrimSpace(proxyURL)
 	}
 	if _, ok := touchedRoots["headers"]; ok {
 		syncAuthFileHeaderAttributes(auth)

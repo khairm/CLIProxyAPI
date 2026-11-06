@@ -58,7 +58,7 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 }
 
 // One transport per proxy and account for the whole process, so connections are pooled across
-// clients but never shared between accounts. These come from config, so the map is not evicted.
+// clients but never shared between accounts. releaseAccountTransports drops an account's entries.
 var (
 	sharedProxyMu         sync.Mutex
 	sharedProxyTransports = map[transportKey]*http.Transport{}

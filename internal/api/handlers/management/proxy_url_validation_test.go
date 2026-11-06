@@ -171,3 +171,57 @@ func TestUploadAuthFileRejectsBadProxyURL(t *testing.T) {
 		})
 	}
 }
+
+func registerPatchTarget(t *testing.T) (*coreauth.Manager, *Handler) {
+	t.Helper()
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "a.json",
+		FileName: "a.json",
+		Provider: "codex",
+		ProxyURL: goodProxy,
+		Metadata: map[string]any{"type": "codex", "proxy_url": goodProxy, "nested": map[string]any{"value": "old"}},
+	}
+	if _, err := manager.Register(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	return manager, NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+}
+
+// A patch that fails partway through applying leaves the live record untouched, whatever order its fields apply in.
+func TestPatchAuthFileFieldsFailingMidApplyLeavesLiveRecordUnchanged(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	for i := 0; i < 20; i++ {
+		manager, h := registerPatchTarget(t)
+
+		rec := serveJSON(h.PatchAuthFileFields, http.MethodPatch, `{"name":"a.json","nested.value":"changed","bad..path":"x"}`)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		live, _ := manager.GetByID("a.json")
+		if got := live.Metadata["nested"].(map[string]any)["value"]; got != "old" {
+			t.Fatalf("run %d: nested.value = %#v, want unchanged", i, got)
+		}
+	}
+}
+
+func TestPatchAuthFileFieldsNullProxyURLClearsTheLiveProxy(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+	manager, h := registerPatchTarget(t)
+
+	rec := serveJSON(h.PatchAuthFileFields, http.MethodPatch, `{"name":"a.json","proxy_url":null}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	live, _ := manager.GetByID("a.json")
+	if live.ProxyURL != "" {
+		t.Fatalf("live ProxyURL = %q, want it cleared like the saved proxy_url", live.ProxyURL)
+	}
+	if got, _ := live.Metadata["proxy_url"].(string); got != "" {
+		t.Fatalf("saved proxy_url = %#v, want cleared", live.Metadata["proxy_url"])
+	}
+}

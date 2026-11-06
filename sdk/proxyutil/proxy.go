@@ -77,17 +77,24 @@ func Parse(raw string) (Setting, error) {
 	return setting, nil
 }
 
-// checkProxyPort requires a port in 1-65535 when one is given, and always for SOCKS5.
+// checkProxyPort requires a well-formed host:port with a port in 1-65535 when a port is given,
+// and always for SOCKS5.
 func checkProxyPort(u *url.URL) error {
-	port := u.Port()
-	if port == "" {
-		if strings.HasSuffix(u.Host, ":") {
-			return fmt.Errorf("proxy URL has an empty port")
-		}
+	if u.Port() == "" && !strings.HasSuffix(u.Host, ":") {
 		if u.Scheme == "socks5" || u.Scheme == "socks5h" {
 			return fmt.Errorf("SOCKS5 proxy URL needs a port")
 		}
 		return nil
+	}
+	host, port, errSplit := net.SplitHostPort(u.Host)
+	if errSplit != nil {
+		return fmt.Errorf("proxy URL host and port are malformed")
+	}
+	if host == "" {
+		return fmt.Errorf("proxy URL missing scheme/host")
+	}
+	if port == "" {
+		return fmt.Errorf("proxy URL has an empty port")
 	}
 	if n, errAtoi := strconv.Atoi(port); errAtoi != nil || n < 1 || n > 65535 {
 		return fmt.Errorf("proxy URL port %q is out of range", port)

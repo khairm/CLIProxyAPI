@@ -50,6 +50,10 @@ func TestParse(t *testing.T) {
 		{name: "ipv6 port too large", input: "https://[::1]:99999", want: ModeInvalid, wantErr: true},
 		{name: "socks5 without port", input: "socks5://proxy.example.com", want: ModeInvalid, wantErr: true},
 		{name: "socks5h port too large", input: "socks5h://proxy.example.com:99999", want: ModeInvalid, wantErr: true},
+		{name: "socks5 extra port", input: "socks5://localhost:1080:80", want: ModeInvalid, wantErr: true},
+		{name: "http extra port", input: "http://proxy.example.com:8080:80", want: ModeInvalid, wantErr: true},
+		{name: "ipv6 with port", input: "socks5://[::1]:1080", want: ModeProxy},
+		{name: "ipv6 without port", input: "http://[::1]", want: ModeProxy},
 	}
 
 	for _, tt := range tests {

@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -25,6 +26,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -468,18 +471,306 @@ func TestUtlsClientReplaysGetAfterAbruptClose(t *testing.T) {
 	}
 }
 
-func TestUtlsClientDoesNotReplayPost(t *testing.T) {
-	t.Parallel()
-	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/", strings.NewReader("{}"))
+// h2Action is what rawH2Server does with the nth complete request it receives (n from 1).
+type h2Action int
+
+const (
+	h2Respond h2Action = iota
+	h2ProtocolError
+	h2RefuseStream
+	h2CloseConn
+)
+
+// rawH2Server is an HTTP/2 server for chatgpt.com that can answer a request it has fully read
+// with a stream reset or a dropped connection, which net/http's server cannot be made to do.
+type rawH2Server struct {
+	port string
+	hits atomic.Int32
+}
+
+func startRawH2Server(t *testing.T, action func(hit int32) h2Action) *rawH2Server {
+	t.Helper()
+	startChatgptServer(t, true, http.NotFoundHandler()) // installs the chatgpt.com cert and test roots
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{Certificates: []stdtls.Certificate{chatgptCert}, NextProtos: []string{"h2"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := replayableRequest(req); ok {
-		t.Fatal("a POST without an idempotency key was marked replayable")
+	t.Cleanup(func() { _ = ln.Close() })
+	s := &rawH2Server{}
+	_, s.port, _ = net.SplitHostPort(ln.Addr().String())
+	go func() {
+		for {
+			conn, errAccept := ln.Accept()
+			if errAccept != nil {
+				return
+			}
+			go s.serve(conn, action)
+		}
+	}()
+	return s
+}
+
+func (s *rawH2Server) url(proxyPath string) string {
+	return "https://chatgpt.com:" + s.port + proxyPath
+}
+
+func (s *rawH2Server) serve(conn net.Conn, action func(hit int32) h2Action) {
+	defer conn.Close()
+	if _, err := io.ReadFull(conn, make([]byte, len(http2.ClientPreface))); err != nil {
+		return
 	}
-	req.Header.Set("Idempotency-Key", "k")
-	if next, ok := replayableRequest(req); !ok || next.Body == nil {
-		t.Fatal("a POST with an idempotency key and a rewindable body should be replayable")
+	framer := http2.NewFramer(conn, conn)
+	if err := framer.WriteSettings(); err != nil {
+		return
+	}
+	var headerBuf bytes.Buffer
+	encoder := hpack.NewEncoder(&headerBuf)
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			return
+		}
+		var streamID uint32
+		switch f := frame.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				_ = framer.WriteSettingsAck()
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				_ = framer.WritePing(true, f.Data)
+			}
+		case *http2.HeadersFrame:
+			if f.StreamEnded() {
+				streamID = f.StreamID
+			}
+		case *http2.DataFrame:
+			if f.StreamEnded() {
+				streamID = f.StreamID
+			}
+		}
+		if streamID == 0 {
+			continue
+		}
+		switch action(s.hits.Add(1)) {
+		case h2ProtocolError:
+			_ = framer.WriteRSTStream(streamID, http2.ErrCodeProtocol)
+		case h2RefuseStream:
+			_ = framer.WriteRSTStream(streamID, http2.ErrCodeRefusedStream)
+		case h2CloseConn:
+			return
+		default:
+			headerBuf.Reset()
+			_ = encoder.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			_ = framer.WriteHeaders(http2.HeadersFrameParam{StreamID: streamID, BlockFragment: headerBuf.Bytes(), EndHeaders: true, EndStream: true})
+		}
+	}
+}
+
+func doRequest(proxyURL string, req *http.Request) error {
+	resp, err := newProxiedUtlsClient(proxyURL).Do(req)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Body.Close()
+}
+
+func TestUtlsClientSendsEachRequestAsOftenAsIsSafe(t *testing.T) {
+	t.Parallel()
+	firstThen := func(first h2Action) func(int32) h2Action {
+		return func(hit int32) h2Action {
+			if hit == 1 {
+				return first
+			}
+			return h2Respond
+		}
+	}
+	cases := []struct {
+		name     string
+		method   string
+		first    h2Action
+		wantOK   bool
+		wantHits int32
+	}{
+		{"POST is not replayed after PROTOCOL_ERROR", http.MethodPost, h2ProtocolError, false, 1},
+		{"POST is not replayed after an abrupt close", http.MethodPost, h2CloseConn, false, 1},
+		{"POST is retried after REFUSED_STREAM", http.MethodPost, h2RefuseStream, true, 2},
+		{"GET is replayed once after an abrupt close", http.MethodGet, h2CloseConn, true, 2},
+		{"GET is replayed once after PROTOCOL_ERROR", http.MethodGet, h2ProtocolError, true, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := startRawH2Server(t, firstThen(tc.first))
+			p := startConnectProxy(t, false)
+			var body io.Reader
+			if tc.method == http.MethodPost {
+				body = strings.NewReader(`{"charge":"once"}`)
+			}
+			req, err := http.NewRequest(tc.method, server.url("/"), body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = doRequest(p.url, req)
+
+			if tc.wantOK && err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Fatal("request succeeded, want the first failure returned")
+			}
+			if got := server.hits.Load(); got != tc.wantHits {
+				t.Fatalf("server received the request %d times, want %d", got, tc.wantHits)
+			}
+		})
+	}
+}
+
+func TestUtlsClientReplaysOnlyOnceWhenTheFailureRepeats(t *testing.T) {
+	t.Parallel()
+	server := startRawH2Server(t, func(int32) h2Action { return h2CloseConn })
+	p := startConnectProxy(t, false)
+	req, err := http.NewRequest(http.MethodGet, server.url("/"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = doRequest(p.url, req); err == nil {
+		t.Fatal("request succeeded against a server that always drops the connection")
+	}
+	if got := server.hits.Load(); got != 2 {
+		t.Fatalf("server received the GET %d times, want 2", got)
+	}
+}
+
+// countingBodies hands out request bodies and counts how often each is closed.
+type countingBodies struct {
+	mu     sync.Mutex
+	closes []*atomic.Int32
+}
+
+type countedBody struct {
+	io.Reader
+	closes *atomic.Int32
+}
+
+func (b countedBody) Close() error { b.closes.Add(1); return nil }
+
+func (c *countingBodies) next() io.ReadCloser {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	closes := &atomic.Int32{}
+	c.closes = append(c.closes, closes)
+	return countedBody{Reader: strings.NewReader("payload"), closes: closes}
+}
+
+func TestUtlsClientClosesEveryAttemptsBodyExactlyOnce(t *testing.T) {
+	t.Parallel()
+	server := startRawH2Server(t, func(int32) h2Action { return h2RefuseStream })
+	p := startConnectProxy(t, false)
+	bodies := &countingBodies{}
+	req, err := http.NewRequest(http.MethodPost, server.url("/"), bodies.next())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(len("payload"))
+	req.GetBody = func() (io.ReadCloser, error) { return bodies.next(), nil }
+
+	if err = doRequest(p.url, req); err == nil {
+		t.Fatal("request succeeded against a server that refuses every stream")
+	}
+	bodies.mu.Lock()
+	defer bodies.mu.Unlock()
+	if len(bodies.closes) != maxUnprocessedRetries+1 {
+		t.Fatalf("bodies used = %d, want %d attempts", len(bodies.closes), maxUnprocessedRetries+1)
+	}
+	for i, closes := range bodies.closes {
+		if got := closes.Load(); got != 1 {
+			t.Fatalf("body %d closed %d times, want once", i, got)
+		}
+	}
+}
+
+func TestUtlsClientCancelledRequestKeepsTheSharedConnection(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := getBody(ctx, p.url, url); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled request: err = %v, want context canceled", err)
+		}
+		if _, err := getBody(context.Background(), p.url, url); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := p.opened.Load(); got != 1 {
+		t.Fatalf("tunnels opened = %d, want 1", got)
+	}
+}
+
+func TestReleasedAccountsDropTheirSharedConnections(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	ctx := context.Background()
+	send := func(auth *cliproxyauth.Auth) {
+		t.Helper()
+		resp, err := NewUtlsHTTPClient(ctx, nil, auth, 0).Get(chatgptURL(server, "/"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	waitForOpenTunnels := func(want int32) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for p.open.Load() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("open tunnels = %d, want %d", p.open.Load(), want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	hasTransport := func(authID string) bool {
+		sharedUtlsMu.Lock()
+		defer sharedUtlsMu.Unlock()
+		for key := range sharedUtlsTransports {
+			if key.authID == authID {
+				return true
+			}
+		}
+		return false
+	}
+
+	moved, _ := manager.Register(ctx, &cliproxyauth.Auth{ID: "released-moved", Provider: "codex", ProxyURL: p.url})
+	removed, _ := manager.Register(ctx, &cliproxyauth.Auth{ID: "released-removed", Provider: "codex", ProxyURL: p.url})
+	send(moved)
+	send(removed)
+	waitForOpenTunnels(2)
+
+	moved.ProxyURL = p.url + "/"
+	if _, err := manager.Update(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	waitForOpenTunnels(1)
+	if hasTransport("released-moved") {
+		t.Fatal("a proxy change kept the account's old transport")
+	}
+
+	manager.Remove(ctx, "released-removed")
+	waitForOpenTunnels(0)
+	if hasTransport("released-removed") {
+		t.Fatal("a removed account kept its transport")
 	}
 }
 
