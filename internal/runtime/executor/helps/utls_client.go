@@ -39,6 +39,14 @@ var (
 	utlsTestRootCAs *x509.CertPool
 )
 
+// SetUtlsRootCAsForTest makes pools created afterwards trust roots; tests outside this
+// package use it to reach a local TLS server. nil restores the system roots.
+func SetUtlsRootCAsForTest(roots *x509.CertPool) {
+	sharedUtlsMu.Lock()
+	utlsTestRootCAs = roots
+	sharedUtlsMu.Unlock()
+}
+
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
 // proxyURL ("" dials directly) used without an account, such as login flows.
 // An invalid proxy URL yields a transport that fails every request.
@@ -426,7 +434,24 @@ type utlsResponseBody struct {
 	conn     *utlsPooledConn
 	release  func()
 	lastRead atomic.Uint64
+	complete atomic.Bool
 	once     sync.Once
+}
+
+// MarkResponseComplete records that the caller has read the response's final event, so a
+// cancel after it is not taken as a silent connection.
+func MarkResponseComplete(body io.ReadCloser) {
+	for body != nil {
+		switch b := body.(type) {
+		case *utlsResponseBody:
+			b.complete.Store(true)
+			return
+		case *usageTTFTReadCloser:
+			body = b.ReadCloser
+		default:
+			return
+		}
+	}
 }
 
 func (b *utlsResponseBody) Read(p []byte) (int, error) {
@@ -448,7 +473,7 @@ func (b *utlsResponseBody) Close() error {
 func (b *utlsResponseBody) finish(complete bool) {
 	b.once.Do(func() {
 		b.release()
-		if !complete && b.ctx.Err() != nil {
+		if !complete && !b.complete.Load() && b.ctx.Err() != nil {
 			b.pool.dropIfSilent(b.conn, b.lastRead.Load())
 		}
 	})

@@ -1140,6 +1140,41 @@ func TestUtlsClientRetiresSilentTunnelWhenAStreamedResponseIsCancelled(t *testin
 	waitFor(t, "the silent tunnel to close", func() bool { return p.open.Load() == 1 })
 }
 
+func TestUtlsClientKeepsTheTunnelWhenAStreamIsCancelledAfterItsFinalEvent(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(50 * time.Millisecond):
+		}
+	}))
+	p := startConnectProxy(t, false)
+	client := newProxiedUtlsClient(p.url)
+
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatgptURL(server, "/sse"), strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = resp.Body.Read(make([]byte, 64)); err != nil {
+			t.Fatalf("request %d final event: %v", i, err)
+		}
+		MarkResponseComplete(&usageTTFTReadCloser{ReadCloser: resp.Body}) // as executors see it via TrackHTTPClient
+		cancel()
+		_ = resp.Body.Close()
+	}
+	if got := p.opened.Load(); got != 1 {
+		t.Fatalf("tunnels opened = %d, want 1 for streams cancelled after their final event", got)
+	}
+}
+
 func TestUtlsClientClosesARetiredConnectionStuckBehindAFullSendBuffer(t *testing.T) {
 	t.Parallel()
 	startChatgptServer(t, true, http.NotFoundHandler()) // installs the chatgpt.com cert and test roots
