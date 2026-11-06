@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"strings"
@@ -24,6 +25,26 @@ type utlsRoundTripper struct {
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
+	h2          *http2.Transport
+	rootCAs     *x509.CertPool
+}
+
+// One round tripper per proxy URL for the whole process, so requests reuse
+// HTTP/2 connections instead of leaving one idle tunnel per request.
+var (
+	sharedUtlsMu  sync.Mutex
+	sharedUtlsRTs = map[string]*utlsRoundTripper{}
+)
+
+func sharedUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+	sharedUtlsMu.Lock()
+	defer sharedUtlsMu.Unlock()
+	rt, ok := sharedUtlsRTs[proxyURL]
+	if !ok {
+		rt = newUtlsRoundTripper(proxyURL)
+		sharedUtlsRTs[proxyURL] = rt
+	}
+	return rt
 }
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
@@ -40,6 +61,11 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		h2: &http2.Transport{
+			IdleConnTimeout: 90 * time.Second,
+			ReadIdleTimeout: 30 * time.Second,
+			PingTimeout:     15 * time.Second,
+		},
 	}
 }
 
@@ -85,7 +111,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tlsConfig := &tls.Config{ServerName: host}
+	tlsConfig := &tls.Config{ServerName: host, RootCAs: t.rootCAs}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
 
 	if err := tlsConn.Handshake(); err != nil {
@@ -93,8 +119,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
-	h2Conn, err := tr.NewClientConn(tlsConn)
+	h2Conn, err := t.h2.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
 		return nil, err
@@ -169,7 +194,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	var utlsRT http.RoundTripper = sharedUtlsRoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
 		if transport := buildProxyTransport(proxyURL); transport != nil {
