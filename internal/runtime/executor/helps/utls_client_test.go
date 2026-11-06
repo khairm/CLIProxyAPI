@@ -125,6 +125,48 @@ type connectProxy struct {
 	accepted atomic.Int32
 	opened   atomic.Int32
 	open     atomic.Int32
+
+	mu      sync.Mutex
+	tunnels []*proxyTunnel
+}
+
+type proxyTunnel struct {
+	client   net.Conn
+	dropping atomic.Bool
+}
+
+// blackHoleOpenTunnels keeps every open tunnel's TCP connection up but drops its bytes.
+func (p *connectProxy) blackHoleOpenTunnels() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, tun := range p.tunnels {
+		tun.dropping.Store(true)
+	}
+}
+
+// closeOpenTunnels cuts every open tunnel without any HTTP/2 GOAWAY.
+func (p *connectProxy) closeOpenTunnels() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, tun := range p.tunnels {
+		_ = tun.client.Close()
+	}
+	p.tunnels = nil
+}
+
+func (tun *proxyTunnel) pipe(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 && !tun.dropping.Load() {
+			if _, errWrite := dst.Write(buf[:n]); errWrite != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func startConnectProxy(t *testing.T, silent bool) *connectProxy {
@@ -183,9 +225,13 @@ func (p *connectProxy) tunnel(client net.Conn) {
 	if _, err = io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		return
 	}
+	tun := &proxyTunnel{client: client}
+	p.mu.Lock()
+	p.tunnels = append(p.tunnels, tun)
+	p.mu.Unlock()
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
+	go func() { tun.pipe(upstream, client); done <- struct{}{} }()
+	go func() { tun.pipe(client, upstream); done <- struct{}{} }()
 	<-done
 }
 
@@ -342,33 +388,146 @@ func TestUtlsClientRetriesRequestsWhenServerSendsGoAway(t *testing.T) {
 	}
 }
 
-func TestUtlsClientKeepsSharedConnectionAfterCancelledRequest(t *testing.T) {
+func TestUtlsClientKeepsReceivingConnectionAfterCancelledRequest(t *testing.T) {
 	t.Parallel()
 	server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slow" {
-			select {
-			case <-r.Context().Done():
-			case <-time.After(5 * time.Second):
+		switch r.URL.Path {
+		case "/slow":
+			<-r.Context().Done()
+		case "/stream":
+			for i := 0; i < 20; i++ {
+				_, _ = io.WriteString(w, "x")
+				w.(http.Flusher).Flush()
+				time.Sleep(20 * time.Millisecond)
 			}
-			return
+		default:
+			writeProto(w, r)
 		}
-		writeProto(w, r)
 	}))
 	p := startConnectProxy(t, false)
 
-	if _, err := getBody(context.Background(), p.url, chatgptURL(server, "/")); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	streamDone := make(chan error, 1)
+	go func() {
+		_, err := getBody(context.Background(), p.url, chatgptURL(server, "/stream"))
+		streamDone <- err
+	}()
+	time.Sleep(60 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if _, err := getBody(ctx, p.url, chatgptURL(server, "/slow")); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("slow request err = %v, want context deadline exceeded", err)
+	}
+	if err := <-streamDone; err != nil {
+		t.Fatalf("stream on the shared connection failed: %v", err)
 	}
 	if _, err := getBody(context.Background(), p.url, chatgptURL(server, "/")); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.opened.Load(); got != 1 {
 		t.Fatalf("tunnels opened = %d, want 1", got)
+	}
+}
+
+func TestUtlsClientDropsSilentTunnelAndRedials(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
+	p.blackHoleOpenTunnels()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := getBody(ctx, p.url, url); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("request on the silent tunnel: err = %v, want context deadline exceeded", err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if body, err := getBody(ctx2, p.url, url); err != nil || body != "HTTP/2.0" {
+		t.Fatalf("request after the silent tunnel: body=%q err=%v", body, err)
+	}
+	if got := p.opened.Load(); got != 2 {
+		t.Fatalf("tunnels opened = %d, want a fresh tunnel after the silent one", got)
+	}
+}
+
+func TestUtlsClientReplaysGetAfterAbruptClose(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	for i := 0; i < 100; i++ {
+		if _, err := getBody(context.Background(), p.url, url); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		p.closeOpenTunnels()
+	}
+}
+
+func TestUtlsClientDoesNotReplayPost(t *testing.T) {
+	t.Parallel()
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := replayableRequest(req); ok {
+		t.Fatal("a POST without an idempotency key was marked replayable")
+	}
+	req.Header.Set("Idempotency-Key", "k")
+	if next, ok := replayableRequest(req); !ok || next.Body == nil {
+		t.Fatal("a POST with an idempotency key and a rewindable body should be replayable")
+	}
+}
+
+func TestUtlsClientClosesBodyWhenNoConnectionIsObtained(t *testing.T) {
+	t.Parallel()
+	p := startConnectProxy(t, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	body := &closeTrackingBody{Reader: strings.NewReader("payload")}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com:1/", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = newProxiedUtlsClient(p.url).Do(req); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+	if !body.closed.Load() {
+		t.Fatal("request body left open after waiting for the shared dial")
+	}
+}
+
+func TestUtlsClientNamesSharedDialFailures(t *testing.T) {
+	t.Parallel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := "http://" + ln.Addr().String()
+	_ = ln.Close()
+
+	if _, err = getBody(context.Background(), refused, "https://chatgpt.com/"); err == nil || !strings.Contains(err.Error(), "utls: shared dial to chatgpt.com:443 failed") {
+		t.Fatalf("err = %v, want a shared dial error", err)
+	}
+}
+
+func TestEquivalentProxySettingsShareOneTransport(t *testing.T) {
+	t.Parallel()
+	same := func(a, b string) bool {
+		return UtlsTransport(a) == UtlsTransport(b) && proxyTransport(a) == proxyTransport(b)
+	}
+	if !same("http://127.0.0.1:10", " HTTP://127.0.0.1:10/ ") {
+		t.Fatal("equivalent proxy URLs got separate transports")
+	}
+	if UtlsTransport("") != UtlsTransport("DIRECT") || UtlsTransport("direct") != UtlsTransport("none") {
+		t.Fatal("direct settings got separate utls transports")
+	}
+	if same("http://127.0.0.1:10", "http://127.0.0.1:11") {
+		t.Fatal("different proxies share a transport")
 	}
 }
 
@@ -399,14 +558,19 @@ func TestInvalidProxyURLFailsEveryRequestAndIsNotCached(t *testing.T) {
 		}
 	}
 	sharedUtlsMu.Lock()
-	_, cachedUtls := sharedUtlsTransports[badProxy]
+	for key := range sharedUtlsTransports {
+		if strings.Contains(key, "proxy.invalid") {
+			t.Errorf("invalid proxy cached in utls transports: %s", key)
+		}
+	}
 	sharedUtlsMu.Unlock()
 	sharedProxyMu.Lock()
-	_, cachedProxy := sharedProxyTransports[badProxy]
-	sharedProxyMu.Unlock()
-	if cachedUtls || cachedProxy {
-		t.Fatalf("invalid proxy cached: utls=%v proxy=%v", cachedUtls, cachedProxy)
+	for key := range sharedProxyTransports {
+		if strings.Contains(key, "proxy.invalid") {
+			t.Errorf("invalid proxy cached in proxy transports: %s", key)
+		}
 	}
+	sharedProxyMu.Unlock()
 }
 
 func TestClientsForTheSameProxyShareTheFallbackTransport(t *testing.T) {

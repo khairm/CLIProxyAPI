@@ -66,15 +66,19 @@ var (
 // proxyTransport returns the shared transport for proxyURL (SOCKS5, HTTP, HTTPS or "direct").
 // An invalid proxy URL yields a transport that fails every request.
 func proxyTransport(proxyURL string) http.RoundTripper {
+	key, errKey := proxyPoolKey(proxyURL)
+	if errKey != nil {
+		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errKey))
+	}
 	sharedProxyMu.Lock()
 	defer sharedProxyMu.Unlock()
-	if transport, ok := sharedProxyTransports[proxyURL]; ok {
+	if transport, ok := sharedProxyTransports[key]; ok {
 		return transport
 	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
 		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errBuild))
 	}
-	sharedProxyTransports[proxyURL] = transport
+	sharedProxyTransports[key] = transport
 	return transport
 }

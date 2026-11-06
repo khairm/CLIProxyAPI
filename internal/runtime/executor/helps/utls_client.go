@@ -3,12 +3,17 @@ package helps
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
@@ -22,12 +27,11 @@ import (
 // utlsDialTimeout bounds proxy CONNECT plus the TLS handshake for one shared connection.
 const utlsDialTimeout = 30 * time.Second
 
-// One HTTP/2 transport per proxy URL for the whole process, so requests share
-// connections instead of leaving one idle tunnel per request. Proxy URLs come
-// from config, so the map is not evicted.
+// One HTTP/2 transport per proxy for the whole process, so requests share connections
+// instead of leaving one idle tunnel per request. Proxy URLs come from config, so the map is not evicted.
 var (
 	sharedUtlsMu         sync.Mutex
-	sharedUtlsTransports = map[string]*http2.Transport{}
+	sharedUtlsTransports = map[string]*utlsRoundTripper{}
 	// utlsTestRootCAs is a test hook guarded by sharedUtlsMu; nil means the system roots.
 	utlsTestRootCAs *x509.CertPool
 )
@@ -42,10 +46,14 @@ func UtlsTransport(proxyURL string) http.RoundTripper {
 	return rt
 }
 
-func sharedUtlsTransport(proxyURL string) (*http2.Transport, error) {
+func sharedUtlsTransport(proxyURL string) (*utlsRoundTripper, error) {
+	key, err := proxyPoolKey(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("utls: invalid proxy %s: %w", proxyutil.Redact(proxyURL), err)
+	}
 	sharedUtlsMu.Lock()
 	defer sharedUtlsMu.Unlock()
-	if rt, ok := sharedUtlsTransports[proxyURL]; ok {
+	if rt, ok := sharedUtlsTransports[key]; ok {
 		return rt, nil
 	}
 	dialer, err := utlsDialer(proxyURL)
@@ -55,18 +63,33 @@ func sharedUtlsTransport(proxyURL string) (*http2.Transport, error) {
 	pool := &utlsConnPool{
 		dialer:  dialer,
 		rootCAs: utlsTestRootCAs,
-		conns:   map[string][]*http2.ClientConn{},
+		conns:   map[string][]*utlsPooledConn{},
 		dialing: map[string]*utlsDial{},
 	}
 	// No idle or ping timeouts: AGENTS.md forbids timeouts after a connection is established.
-	rt := &http2.Transport{ConnPool: pool}
-	pool.h2 = rt
-	sharedUtlsTransports[proxyURL] = rt
+	h2 := &http2.Transport{ConnPool: pool}
+	pool.h2 = h2
+	rt := &utlsRoundTripper{h2: h2, pool: pool}
+	sharedUtlsTransports[key] = rt
 	return rt, nil
 }
 
+// proxyPoolKey names the pool for a proxy setting: "direct" for no proxy, otherwise the
+// proxy URL without path or case differences, so equivalent settings share one pool.
+func proxyPoolKey(raw string) (string, error) {
+	setting, err := proxyutil.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if setting.Mode != proxyutil.ModeProxy {
+		return "direct", nil
+	}
+	key := url.URL{Scheme: setting.URL.Scheme, User: setting.URL.User, Host: strings.ToLower(setting.URL.Host)}
+	return key.String(), nil
+}
+
 func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
-	if proxyURL == "" {
+	if strings.TrimSpace(proxyURL) == "" {
 		return proxy.Direct, nil
 	}
 	dialer, _, err := proxyutil.BuildDialer(proxyURL)
@@ -80,6 +103,81 @@ func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
 	return contextDialer, nil
 }
 
+// utlsRoundTripper wraps the shared HTTP/2 transport with what it lacks for a long-lived
+// shared connection: closing the body when no connection was obtained, dropping a
+// connection that has gone silent, and one replay of a safe request after an abrupt close.
+type utlsRoundTripper struct {
+	h2   *http2.Transport
+	pool *utlsConnPool
+}
+
+type utlsAttemptKey struct{}
+
+// utlsAttempt records the connection the pool handed to one request attempt.
+type utlsAttempt struct {
+	conn        *utlsPooledConn
+	readAtStart uint64
+}
+
+func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	for replayed := false; ; replayed = true {
+		attempt := &utlsAttempt{}
+		resp, err := t.h2.RoundTrip(req.WithContext(context.WithValue(req.Context(), utlsAttemptKey{}, attempt)))
+		if err == nil {
+			return resp, nil
+		}
+		if attempt.conn == nil {
+			// No connection was obtained, so http2 never took ownership of the body.
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, err
+		}
+		if req.Context().Err() != nil {
+			t.pool.dropIfSilent(attempt)
+			return nil, err
+		}
+		if replayed || !isAbruptClose(err) {
+			return nil, err
+		}
+		next, ok := replayableRequest(req)
+		if !ok {
+			return nil, err
+		}
+		req = next
+	}
+}
+
+// isAbruptClose reports a connection that ended without a GOAWAY before the response headers.
+func isAbruptClose(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
+// replayableRequest returns a fresh copy of req when it is safe to send again: an idempotent
+// method (or an idempotency key, as net/http allows) and a body that can be rewound.
+func replayableRequest(req *http.Request) (*http.Request, bool) {
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+	default:
+		if req.Header.Get("Idempotency-Key") == "" && req.Header.Get("X-Idempotency-Key") == "" {
+			return nil, false
+		}
+	}
+	next := req.Clone(req.Context())
+	if req.Body == nil || req.Body == http.NoBody {
+		return next, true
+	}
+	if req.GetBody == nil {
+		return nil, false
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, false
+	}
+	next.Body = body
+	return next, true
+}
+
 // utlsConnPool is an http2.ClientConnPool that dials once per address and lets
 // each waiting request give up when its own context ends.
 type utlsConnPool struct {
@@ -87,23 +185,57 @@ type utlsConnPool struct {
 	dialer  proxy.ContextDialer
 	rootCAs *x509.CertPool
 	mu      sync.Mutex
-	conns   map[string][]*http2.ClientConn
+	conns   map[string][]*utlsPooledConn
 	dialing map[string]*utlsDial
+}
+
+// utlsPooledConn is a shared connection plus a count of the bytes it has received,
+// which tells a silent (dead) tunnel apart from a slow but healthy one.
+type utlsPooledConn struct {
+	cc   *http2.ClientConn
+	read atomic.Uint64
+}
+
+type countingConn struct {
+	net.Conn
+	read *atomic.Uint64
+}
+
+func (c countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.read.Add(uint64(n))
+	return n, err
 }
 
 type utlsDial struct {
 	done chan struct{}
-	cc   *http2.ClientConn
+	conn *utlsPooledConn
 	err  error
 }
 
 func (p *utlsConnPool) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
+	attempt, _ := req.Context().Value(utlsAttemptKey{}).(*utlsAttempt)
+	if attempt != nil {
+		attempt.conn = nil
+	}
+	conn, err := p.reserve(req, addr)
+	if err != nil {
+		return nil, err
+	}
+	if attempt != nil {
+		attempt.conn = conn
+		attempt.readAtStart = conn.read.Load()
+	}
+	return conn.cc, nil
+}
+
+func (p *utlsConnPool) reserve(req *http.Request, addr string) (*utlsPooledConn, error) {
 	for {
 		p.mu.Lock()
-		for _, cc := range p.conns[addr] {
-			if cc.ReserveNewRequest() {
+		for _, conn := range p.conns[addr] {
+			if conn.cc.ReserveNewRequest() {
 				p.mu.Unlock()
-				return cc, nil
+				return conn, nil
 			}
 		}
 		d, ok := p.dialing[addr]
@@ -122,8 +254,8 @@ func (p *utlsConnPool) GetClientConn(req *http.Request, addr string) (*http2.Cli
 		if d.err != nil {
 			return nil, d.err
 		}
-		if d.cc.ReserveNewRequest() {
-			return d.cc, nil
+		if d.conn.cc.ReserveNewRequest() {
+			return d.conn, nil
 		}
 	}
 }
@@ -132,7 +264,7 @@ func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for addr, list := range p.conns {
-		if i := slices.Index(list, cc); i >= 0 {
+		if i := slices.IndexFunc(list, func(conn *utlsPooledConn) bool { return conn.cc == cc }); i >= 0 {
 			if list = slices.Delete(list, i, i+1); len(list) == 0 {
 				delete(p.conns, addr)
 			} else {
@@ -143,22 +275,39 @@ func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
 	}
 }
 
+// dropIfSilent retires the attempt's connection when the request's context ended and the
+// connection received nothing at all meanwhile: the tunnel is dead, so new requests must
+// dial a fresh one. Shutdown lets any other streams on it finish, then closes it.
+func (p *utlsConnPool) dropIfSilent(attempt *utlsAttempt) {
+	if attempt.conn.read.Load() != attempt.readAtStart {
+		return
+	}
+	cc := attempt.conn.cc
+	p.MarkDead(cc)
+	go func() { _ = cc.Shutdown(context.Background()) }()
+}
+
 // dial runs detached from any one request, so a cancelled first caller does not fail the others.
 func (p *utlsConnPool) dial(d *utlsDial, addr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), utlsDialTimeout)
 	defer cancel()
 	conn, err := p.dialTLS(ctx, addr)
 	if err == nil {
-		if d.cc, err = p.h2.NewClientConn(conn); err != nil {
+		pooled := &utlsPooledConn{}
+		if pooled.cc, err = p.h2.NewClientConn(countingConn{Conn: conn, read: &pooled.read}); err != nil {
 			_ = conn.Close()
+		} else {
+			d.conn = pooled
 		}
 	}
-	d.err = err
+	if err != nil {
+		d.err = fmt.Errorf("utls: shared dial to %s failed: %w", addr, err)
+	}
 
 	p.mu.Lock()
 	delete(p.dialing, addr)
 	if err == nil {
-		p.conns[addr] = append(p.conns[addr], d.cc)
+		p.conns[addr] = append(p.conns[addr], d.conn)
 	}
 	p.mu.Unlock()
 	close(d.done)

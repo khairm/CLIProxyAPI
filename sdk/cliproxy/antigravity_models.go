@@ -38,7 +38,13 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 	}
 
 	client := &http.Client{}
-	if transport, _, errProxy := proxyutil.BuildHTTPTransport(s.antigravityModelFetchProxyURL(auth)); errProxy == nil && transport != nil {
+	proxyURL := s.antigravityModelFetchProxyURL(auth)
+	transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyURL)
+	if errProxy != nil {
+		log.Errorf("antigravity model hints: invalid proxy %s: %v", proxyutil.Redact(proxyURL), errProxy)
+		return antigravityModelCapabilityHints{}
+	}
+	if transport != nil {
 		client.Transport = transport
 	}
 

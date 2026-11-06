@@ -4,6 +4,7 @@
 package util
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -12,8 +13,8 @@ import (
 )
 
 // SetProxy configures the provided HTTP client with proxy settings from the configuration.
-// It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
-// to route requests through the configured proxy server.
+// It supports SOCKS5, HTTP, and HTTPS proxies. An unusable proxy setting gives the client a
+// transport that fails every request, so traffic never silently goes direct.
 func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 	if cfg == nil || httpClient == nil {
 		return httpClient
@@ -21,7 +22,10 @@ func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
 	if errBuild != nil {
-		log.Errorf("%v", errBuild)
+		err := fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(cfg.ProxyURL), errBuild)
+		log.Error(err)
+		httpClient.Transport = proxyutil.FailingTransport(err)
+		return httpClient
 	}
 	if transport != nil {
 		httpClient.Transport = transport

@@ -60,12 +60,13 @@ type codexOAuthService interface {
 }
 
 var (
-	callbackForwardersMu  sync.Mutex
-	callbackForwarders    = make(map[int]*callbackForwarder)
-	errAuthFileMustBeJSON = errors.New("auth file must be .json")
-	errAuthFileNotFound   = errors.New("auth file not found")
-	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
-	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
+	callbackForwardersMu    sync.Mutex
+	callbackForwarders      = make(map[int]*callbackForwarder)
+	errAuthFileMustBeJSON   = errors.New("auth file must be .json")
+	errAuthFileInvalidProxy = errors.New("auth file has an invalid proxy_url")
+	errAuthFileNotFound     = errors.New("auth file not found")
+	errPluginVirtualAuth    = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
+	newCodexOAuthService    = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -751,6 +752,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
+			if errors.Is(errUpload, errAuthFileInvalidProxy) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
 			return
 		}
@@ -807,7 +812,11 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		status := 500
+		if errors.Is(err, errAuthFileInvalidProxy) {
+			status = 400
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -1161,6 +1170,11 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
+	if value, ok := metadata["proxy_url"]; ok {
+		if errProxy := validateAuthFileProxyURL("proxy_url", value); errProxy != nil {
+			return nil, fmt.Errorf("%w: %v", errAuthFileInvalidProxy, errProxy)
+		}
+	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
@@ -1481,8 +1495,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	changed := false
-	touchedRoots := make(map[string]struct{}, len(req))
+	// Validate the whole patch before touching anything, so a rejected patch changes nothing.
+	type fieldPatch struct {
+		path  string
+		value any
+	}
+	patches := make([]fieldPatch, 0, len(req))
 	for key, rawValue := range req {
 		fieldPath := strings.TrimSpace(key)
 		if fieldPath == "" {
@@ -1494,20 +1512,30 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
 			return
 		}
-		if targetAuth.Metadata == nil {
-			targetAuth.Metadata = make(map[string]any)
+		if rootAuthFileField(fieldPath) == "proxy_url" {
+			if errProxy := validateAuthFileProxyURL(fieldPath, value); errProxy != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errProxy.Error()})
+				return
+			}
 		}
+		patches = append(patches, fieldPatch{path: fieldPath, value: value})
+	}
 
-		if raw, isString := value.(string); isString && fieldPath == "proxy_url" && rejectInvalidProxyURL(c, "proxy_url", raw) {
-			return
-		}
-		if fieldPath == "headers" {
-			applyAuthFileHeadersPatch(targetAuth, value)
-		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
+	// GetByID clones only the top level, so detach nested metadata from the live record.
+	targetAuth.Metadata = cloneAuthMetadata(targetAuth.Metadata)
+	if targetAuth.Metadata == nil {
+		targetAuth.Metadata = make(map[string]any)
+	}
+	changed := false
+	touchedRoots := make(map[string]struct{}, len(patches))
+	for _, patch := range patches {
+		if patch.path == "headers" {
+			applyAuthFileHeadersPatch(targetAuth, patch.value)
+		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, patch.path, patch.value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 			return
 		}
-		if root := rootAuthFileField(fieldPath); root != "" {
+		if root := rootAuthFileField(patch.path); root != "" {
 			touchedRoots[root] = struct{}{}
 		}
 		changed = true
@@ -1529,6 +1557,55 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// validateAuthFileProxyURL requires proxy_url to be set whole, as a string that is a usable proxy setting.
+func validateAuthFileProxyURL(fieldPath string, value any) error {
+	if fieldPath != "proxy_url" {
+		return fmt.Errorf("%s: proxy_url must be set as a whole string", fieldPath)
+	}
+	if value == nil {
+		return nil
+	}
+	raw, isString := value.(string)
+	if !isString {
+		return fmt.Errorf("proxy_url must be a string")
+	}
+	return config.ValidateProxyURL("proxy_url", raw)
+}
+
+func cloneAuthMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	out := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		out[key] = cloneAuthMetadataValue(value)
+	}
+	return out
+}
+
+func cloneAuthMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneAuthMetadata(typed)
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneAuthMetadataValue(item)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return value
+	}
 }
 
 func decodeAuthFileFieldValue(raw json.RawMessage) (any, error) {

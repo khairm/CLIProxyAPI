@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,20 +57,42 @@ func Parse(raw string) (Setting, error) {
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("parse proxy URL failed")
 	}
-	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+	if parsedURL.Scheme == "" || parsedURL.Hostname() == "" {
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("proxy URL missing scheme/host")
 	}
 
 	switch parsedURL.Scheme {
 	case "socks5", "socks5h", "http", "https":
-		setting.Mode = ModeProxy
-		setting.URL = parsedURL
-		return setting, nil
 	default:
 		setting.Mode = ModeInvalid
 		return setting, fmt.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
 	}
+	if errPort := checkProxyPort(parsedURL); errPort != nil {
+		setting.Mode = ModeInvalid
+		return setting, errPort
+	}
+	setting.Mode = ModeProxy
+	setting.URL = parsedURL
+	return setting, nil
+}
+
+// checkProxyPort requires a port in 1-65535 when one is given, and always for SOCKS5.
+func checkProxyPort(u *url.URL) error {
+	port := u.Port()
+	if port == "" {
+		if strings.HasSuffix(u.Host, ":") {
+			return fmt.Errorf("proxy URL has an empty port")
+		}
+		if u.Scheme == "socks5" || u.Scheme == "socks5h" {
+			return fmt.Errorf("SOCKS5 proxy URL needs a port")
+		}
+		return nil
+	}
+	if n, errAtoi := strconv.Atoi(port); errAtoi != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("proxy URL port %q is out of range", port)
+	}
+	return nil
 }
 
 func cloneDefaultTransport() *http.Transport {
