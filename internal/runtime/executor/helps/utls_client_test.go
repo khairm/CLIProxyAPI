@@ -407,8 +407,11 @@ func TestUtlsClientRequestsReturnOnDeadlineWhenProxyIsSilent(t *testing.T) {
 func TestUtlsClientRetriesRequestsWhenServerSendsGoAway(t *testing.T) {
 	t.Parallel()
 	var served atomic.Int32
+	// Each connection serves 50 streams before its GOAWAY, more than the 40 requests in flight, so a
+	// request refused above last-stream-id fits on the next connection. With 25 and retry backoff
+	// off in tests, one request could be refused on 7 connections in a row and run out of retries.
 	server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if served.Add(1)%25 == 0 {
+		if served.Add(1)%50 == 0 {
 			w.Header().Set("Connection", "close") // the HTTP/2 server answers with GOAWAY
 		}
 		writeProto(w, r)
