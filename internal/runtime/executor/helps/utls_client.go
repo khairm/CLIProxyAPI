@@ -152,7 +152,10 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			body.Close()
 			return nil, err
 		}
-		release := conn.use(req.Context())
+		if h := testHooks.Load(); h != nil {
+			h.afterReserve(req)
+		}
+		release := conn.track(req.Context())
 		readAtStart := conn.read.Load()
 		resp, err := conn.cc.RoundTrip(attempt)
 		if err == nil {
@@ -334,37 +337,71 @@ type utlsConnPool struct {
 type utlsPooledConn struct {
 	cc        *http2.ClientConn
 	read      atomic.Uint64
-	dead      atomic.Bool  // its read loop stopped, so it can never carry another request
-	live      atomic.Int32 // requests using it whose contexts have not ended
-	retired   atomic.Bool
+	dead      atomic.Bool // its read loop stopped, so it can never carry another request
+	mu        sync.Mutex  // orders reservations against retire's decision to close
+	live      int         // reserved requests whose contexts have not ended
+	retired   bool
 	closeOnce sync.Once
 }
 
-// use counts one request on conn until the returned release runs or its context ends. Closing
-// a retired conn waits for those requests only, never for a stuck write.
-func (c *utlsPooledConn) use(ctx context.Context) (release func()) {
-	c.live.Add(1)
-	var once sync.Once
-	done := func() {
-		once.Do(func() {
-			if c.live.Add(-1) == 0 && c.retired.Load() {
-				c.close()
-			}
-		})
+// tryReserve reserves a stream and counts one live request in a single step, so a conn retire
+// has already chosen to close is never handed out and retire never closes under a new request.
+func (c *utlsPooledConn) tryReserve() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.retired || !c.cc.ReserveNewRequest() {
+		return false
 	}
+	c.live++
+	return true
+}
+
+// track ends the request tryReserve counted when the returned release runs or its context ends.
+// Closing a retired conn waits for those requests only, never for a stuck write.
+func (c *utlsPooledConn) track(ctx context.Context) (release func()) {
+	var once sync.Once
+	done := func() { once.Do(c.done) }
 	stop := context.AfterFunc(ctx, done)
 	return func() { stop(); done() }
 }
 
+func (c *utlsPooledConn) done() {
+	c.mu.Lock()
+	c.live--
+	closing := c.live == 0 && c.retired
+	c.mu.Unlock()
+	if closing {
+		c.close()
+	}
+}
+
 func (c *utlsPooledConn) retire() {
-	c.retired.Store(true)
-	if c.live.Load() == 0 {
+	c.mu.Lock()
+	c.retired = true
+	closing := c.live == 0
+	c.mu.Unlock()
+	if closing {
 		c.close()
 	}
 }
 
 // close drops the socket at once; Shutdown would wait behind a writer stuck on a full send buffer.
-func (c *utlsPooledConn) close() { c.closeOnce.Do(func() { _ = c.cc.Close() }) }
+func (c *utlsPooledConn) close() {
+	c.closeOnce.Do(func() {
+		if h := testHooks.Load(); h != nil {
+			h.beforeRetiredClose()
+		}
+		_ = c.cc.Close()
+	})
+}
+
+// testHooks lets tests pause at the scheduling points around retirement; nil in production.
+var testHooks atomic.Pointer[utlsTestHooks]
+
+type utlsTestHooks struct {
+	afterReserve       func(*http.Request)
+	beforeRetiredClose func()
+}
 
 type countingConn struct {
 	net.Conn
@@ -429,11 +466,12 @@ func (p *utlsConnPool) GetClientConn(req *http.Request, addr string) (*http2.Cli
 	if err != nil {
 		return nil, err
 	}
+	conn.done() // http2 tracks its own streams on this path
 	return conn.cc, nil
 }
 
-// reserve returns a shared connection with a stream reserved for one request, dialling one
-// when none can take it. A request whose context has already ended reserves nothing.
+// reserve returns a shared connection with a stream reserved and counted for one request,
+// dialling one when none can take it. A request whose context has already ended reserves nothing.
 func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledConn, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -442,7 +480,7 @@ func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledCon
 		p.mu.Lock()
 		p.dropDeadLocked(addr)
 		for _, conn := range p.conns[addr] {
-			if conn.cc.ReserveNewRequest() {
+			if conn.tryReserve() {
 				p.mu.Unlock()
 				return conn, nil
 			}
@@ -463,7 +501,7 @@ func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledCon
 		if d.err != nil {
 			return nil, d.err
 		}
-		if ctx.Err() == nil && d.conn.cc.ReserveNewRequest() {
+		if ctx.Err() == nil && d.conn.tryReserve() {
 			return d.conn, nil
 		}
 	}

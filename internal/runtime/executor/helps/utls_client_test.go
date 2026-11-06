@@ -1250,3 +1250,124 @@ func TestUtlsClientReplaysOnlySafeRequestsAfterAForcedClose(t *testing.T) {
 		})
 	}
 }
+
+// A request that reserved a stream must keep its connection even when another request's cancel
+// retires that connection before the first one is sent: closing it would abort a plain POST the
+// server already received, and such a POST is never resent.
+func TestUtlsClientRetireNeverClosesUnderAReservedRequest(t *testing.T) {
+	aStarted := make(chan struct{})
+	postReceived := make(chan struct{})
+	var postHits atomic.Int32
+	quit := make(chan struct{})
+	server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/quiet":
+			close(aStarted)
+			select {
+			case <-r.Context().Done():
+			case <-quit:
+			}
+		case "/post":
+			if postHits.Add(1) == 1 {
+				close(postReceived)
+			}
+			time.Sleep(300 * time.Millisecond)
+			_, _ = io.WriteString(w, "ok")
+		default:
+			writeProto(w, r)
+		}
+	}))
+	t.Cleanup(func() { close(quit) })
+	p := startConnectProxy(t, false)
+	if _, err := getBody(context.Background(), p.url, chatgptURL(server, "/")); err != nil {
+		t.Fatal(err)
+	}
+
+	bReserved := make(chan struct{})
+	goB := make(chan struct{})
+	var releaseB sync.Once
+	letBGo := func() { releaseB.Do(func() { close(goB) }) }
+	testHooks.Store(&utlsTestHooks{
+		afterReserve: func(req *http.Request) {
+			if req.URL.Path == "/post" {
+				close(bReserved)
+				<-goB
+			}
+		},
+		beforeRetiredClose: func() {
+			letBGo()
+			select {
+			case <-postReceived:
+			case <-time.After(2 * time.Second):
+			}
+		},
+	})
+	defer testHooks.Store(nil)
+
+	bDone := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, chatgptURL(server, "/post"), strings.NewReader("charge-once"))
+		if err != nil {
+			bDone <- err
+			return
+		}
+		resp, err := newProxiedUtlsClient(p.url).Do(req)
+		if err != nil {
+			bDone <- err
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err == nil && string(body) != "ok" {
+			err = fmt.Errorf("body = %q, want ok", body)
+		}
+		bDone <- err
+	}()
+	<-bReserved
+
+	ctx, cancel := context.WithCancel(context.Background())
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := getBody(ctx, p.url, chatgptURL(server, "/quiet"))
+		aDone <- err
+	}()
+	<-aStarted
+	cancel()
+	if err := <-aDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("quiet request err = %v, want context canceled", err)
+	}
+	letBGo()
+
+	if err := <-bDone; err != nil {
+		t.Fatalf("reserved POST failed after another request retired its connection: %v", err)
+	}
+	if got := postHits.Load(); got != 1 {
+		t.Fatalf("POST reached the server %d times, want 1", got)
+	}
+}
+
+func TestUtlsClientNeverReservesARetiredConnection(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	if _, err := getBody(context.Background(), p.url, chatgptURL(server, "/")); err != nil {
+		t.Fatal(err)
+	}
+	conns := pooledConns(t, p.url)
+	if len(conns) != 1 {
+		t.Fatalf("pooled conns = %d, want 1", len(conns))
+	}
+	conn := conns[0]
+	if !conn.tryReserve() {
+		t.Fatal("healthy conn refused a reservation")
+	}
+	conn.retire()
+	if conn.tryReserve() {
+		t.Fatal("retired conn accepted a new reservation")
+	}
+	if conn.cc.State().Closed {
+		t.Fatal("retire closed the conn under a reserved request")
+	}
+	conn.done()
+	waitFor(t, "the retired conn to close", func() bool { return p.open.Load() == 0 })
+}
