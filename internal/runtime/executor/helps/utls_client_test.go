@@ -70,6 +70,11 @@ var (
 // startChatgptServer serves TLS for chatgpt.com on loopback; utls trusts it through the test hook.
 func startChatgptServer(t *testing.T, h2 bool, handler http.Handler) *httptest.Server {
 	t.Helper()
+	return startChatgptServerWithIdleTimeout(t, h2, handler, 0)
+}
+
+func startChatgptServerWithIdleTimeout(t *testing.T, h2 bool, handler http.Handler, idle time.Duration) *httptest.Server {
+	t.Helper()
 	chatgptCertOnce.Do(func() {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -102,6 +107,7 @@ func startChatgptServer(t *testing.T, h2 bool, handler http.Handler) *httptest.S
 	})
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = h2
+	server.Config.IdleTimeout = idle
 	server.TLS = &stdtls.Config{Certificates: []stdtls.Certificate{chatgptCert}}
 	server.StartTLS()
 	t.Cleanup(server.Close)
@@ -229,15 +235,10 @@ func burst(n int, proxyURL, url string) []error {
 
 func writeProto(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, r.Proto) }
 
-func TestUtlsClientsShareOneTunnelAndCloseItWhenIdle(t *testing.T) {
+func TestUtlsClientsShareOneTunnel(t *testing.T) {
 	t.Parallel()
 	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
 	p := startConnectProxy(t, false)
-	rt, err := sharedUtlsTransport(p.url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rt.IdleConnTimeout = 300 * time.Millisecond
 
 	if errs := burst(50, p.url, chatgptURL(server, "/")); len(errs) > 0 {
 		t.Fatalf("%d of 50 requests failed, first: %v", len(errs), errs[0])
@@ -245,12 +246,29 @@ func TestUtlsClientsShareOneTunnelAndCloseItWhenIdle(t *testing.T) {
 	if got := p.opened.Load(); got != 1 {
 		t.Fatalf("tunnels opened = %d, want 1", got)
 	}
+}
+
+func TestUtlsClientRedialsAfterServerClosesIdleConnection(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServerWithIdleTimeout(t, true, http.HandlerFunc(writeProto), 200*time.Millisecond)
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for p.open.Load() != 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("idle tunnel still open after the idle timeout")
+			t.Fatal("server never closed the idle connection")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if body, err := getBody(context.Background(), p.url, url); err != nil || body != "HTTP/2.0" {
+		t.Fatalf("request after idle close: body=%q err=%v", body, err)
+	}
+	if got := p.opened.Load(); got != 2 {
+		t.Fatalf("tunnels opened = %d, want 2", got)
 	}
 }
 

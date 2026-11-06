@@ -58,12 +58,8 @@ func sharedUtlsTransport(proxyURL string) (*http2.Transport, error) {
 		conns:   map[string][]*http2.ClientConn{},
 		dialing: map[string]*utlsDial{},
 	}
-	rt := &http2.Transport{
-		ConnPool:        pool,
-		IdleConnTimeout: 90 * time.Second,
-		ReadIdleTimeout: 30 * time.Second,
-		PingTimeout:     15 * time.Second,
-	}
+	// No idle or ping timeouts: AGENTS.md forbids timeouts after a connection is established.
+	rt := &http2.Transport{ConnPool: pool}
 	pool.h2 = rt
 	sharedUtlsTransports[proxyURL] = rt
 	return rt, nil
