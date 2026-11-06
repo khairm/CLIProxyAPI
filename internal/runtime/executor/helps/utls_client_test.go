@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,32 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+func TestMain(m *testing.M) {
+	// Retries skip x/net's 1s, 2s, 4s... backoff in tests; TestRetryBackoffFollowsXNet covers it.
+	retryBackoff = func(int) time.Duration { return 0 }
+	os.Exit(m.Run())
+}
+
+func TestRetryBackoffFollowsXNet(t *testing.T) {
+	if d := xnetRetryBackoff(0); d != 0 {
+		t.Fatalf("first retry waits %v, want no wait", d)
+	}
+	for retry, base := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 3: 4 * time.Second, 6: 32 * time.Second} {
+		if d := xnetRetryBackoff(retry); d < base || d > base+base/10 {
+			t.Fatalf("retry %d waits %v, want %v plus up to 10%%", retry, d, base)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := waitBeforeRetry(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("a cancelled request kept waiting for its retry")
+	}
+}
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -479,6 +506,9 @@ const (
 	h2ProtocolError
 	h2RefuseStream
 	h2CloseConn
+	h2GoAwayAbove    // GOAWAY whose last stream id is below this stream, then close
+	h2GoAwayCovering // GOAWAY whose last stream id covers this stream, then close
+	h2MissingStatus  // response HEADERS without :status
 )
 
 // rawH2Server is an HTTP/2 server for chatgpt.com that can answer a request it has fully read
@@ -559,6 +589,16 @@ func (s *rawH2Server) serve(conn net.Conn, action func(hit int32) h2Action) {
 			_ = framer.WriteRSTStream(streamID, http2.ErrCodeRefusedStream)
 		case h2CloseConn:
 			return
+		case h2GoAwayAbove:
+			_ = framer.WriteGoAway(streamID-1, http2.ErrCodeNo, nil)
+			return
+		case h2GoAwayCovering:
+			_ = framer.WriteGoAway(streamID, http2.ErrCodeNo, nil)
+			return
+		case h2MissingStatus:
+			headerBuf.Reset()
+			_ = encoder.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+			_ = framer.WriteHeaders(http2.HeadersFrameParam{StreamID: streamID, BlockFragment: headerBuf.Bytes(), EndHeaders: true, EndStream: true})
 		default:
 			headerBuf.Reset()
 			_ = encoder.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
@@ -587,17 +627,22 @@ func TestUtlsClientSendsEachRequestAsOftenAsIsSafe(t *testing.T) {
 		}
 	}
 	cases := []struct {
-		name     string
-		method   string
-		first    h2Action
-		wantOK   bool
-		wantHits int32
+		name           string
+		method         string
+		idempotencyKey bool
+		first          h2Action
+		wantOK         bool
+		wantHits       int32
 	}{
-		{"POST is not replayed after PROTOCOL_ERROR", http.MethodPost, h2ProtocolError, false, 1},
-		{"POST is not replayed after an abrupt close", http.MethodPost, h2CloseConn, false, 1},
-		{"POST is retried after REFUSED_STREAM", http.MethodPost, h2RefuseStream, true, 2},
-		{"GET is replayed once after an abrupt close", http.MethodGet, h2CloseConn, true, 2},
-		{"GET is replayed once after PROTOCOL_ERROR", http.MethodGet, h2ProtocolError, true, 2},
+		{"POST is not replayed after PROTOCOL_ERROR", http.MethodPost, false, h2ProtocolError, false, 1},
+		{"POST is not replayed after an abrupt close", http.MethodPost, false, h2CloseConn, false, 1},
+		{"POST is retried after REFUSED_STREAM", http.MethodPost, false, h2RefuseStream, true, 2},
+		{"POST is retried after a GOAWAY below its stream", http.MethodPost, false, h2GoAwayAbove, true, 2},
+		{"POST is not resent after a GOAWAY covering its stream", http.MethodPost, false, h2GoAwayCovering, false, 1},
+		{"POST with an idempotency key is replayed once after an abrupt close", http.MethodPost, true, h2CloseConn, true, 2},
+		{"GET is replayed once after an abrupt close", http.MethodGet, false, h2CloseConn, true, 2},
+		{"GET is replayed once after PROTOCOL_ERROR", http.MethodGet, false, h2ProtocolError, true, 2},
+		{"GET is not replayed after a malformed response", http.MethodGet, false, h2MissingStatus, false, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -611,6 +656,9 @@ func TestUtlsClientSendsEachRequestAsOftenAsIsSafe(t *testing.T) {
 			req, err := http.NewRequest(tc.method, server.url("/"), body)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if tc.idempotencyKey {
+				req.Header.Set("Idempotency-Key", "charge-once")
 			}
 
 			err = doRequest(p.url, req)
@@ -713,64 +761,6 @@ func TestUtlsClientCancelledRequestKeepsTheSharedConnection(t *testing.T) {
 	}
 	if got := p.opened.Load(); got != 1 {
 		t.Fatalf("tunnels opened = %d, want 1", got)
-	}
-}
-
-func TestReleasedAccountsDropTheirSharedConnections(t *testing.T) {
-	t.Parallel()
-	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
-	p := startConnectProxy(t, false)
-	manager := cliproxyauth.NewManager(nil, nil, nil)
-	ctx := context.Background()
-	send := func(auth *cliproxyauth.Auth) {
-		t.Helper()
-		resp, err := NewUtlsHTTPClient(ctx, nil, auth, 0).Get(chatgptURL(server, "/"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}
-	waitForOpenTunnels := func(want int32) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for p.open.Load() != want {
-			if time.Now().After(deadline) {
-				t.Fatalf("open tunnels = %d, want %d", p.open.Load(), want)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	}
-	hasTransport := func(authID string) bool {
-		sharedUtlsMu.Lock()
-		defer sharedUtlsMu.Unlock()
-		for key := range sharedUtlsTransports {
-			if key.authID == authID {
-				return true
-			}
-		}
-		return false
-	}
-
-	moved, _ := manager.Register(ctx, &cliproxyauth.Auth{ID: "released-moved", Provider: "codex", ProxyURL: p.url})
-	removed, _ := manager.Register(ctx, &cliproxyauth.Auth{ID: "released-removed", Provider: "codex", ProxyURL: p.url})
-	send(moved)
-	send(removed)
-	waitForOpenTunnels(2)
-
-	moved.ProxyURL = p.url + "/"
-	if _, err := manager.Update(ctx, moved); err != nil {
-		t.Fatal(err)
-	}
-	waitForOpenTunnels(1)
-	if hasTransport("released-moved") {
-		t.Fatal("a proxy change kept the account's old transport")
-	}
-
-	manager.Remove(ctx, "released-removed")
-	waitForOpenTunnels(0)
-	if hasTransport("released-removed") {
-		t.Fatal("a removed account kept its transport")
 	}
 }
 

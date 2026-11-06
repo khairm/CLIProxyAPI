@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,50 +30,14 @@ const utlsDialTimeout = 30 * time.Second
 
 // One HTTP/2 transport per proxy and account for the whole process, so requests share
 // connections instead of leaving one idle tunnel per request, and accounts never share one.
-// releaseAccountTransports drops an account's entries when it is removed or its proxy changes.
+// Entries are never evicted: a removed account or replaced proxy keeps only memory, because the
+// upstream closes its idle tunnel (chatgpt.com after about 6.5 minutes).
 var (
 	sharedUtlsMu         sync.Mutex
 	sharedUtlsTransports = map[transportKey]*utlsRoundTripper{}
 	// utlsTestRootCAs is a test hook guarded by sharedUtlsMu; nil means the system roots.
 	utlsTestRootCAs *x509.CertPool
 )
-
-func init() {
-	cliproxyauth.OnAuthReleased(releaseAccountTransports)
-}
-
-// releaseAccountTransports forgets every shared transport of authID and shuts down their
-// connections once their open streams finish. The account-less ("") transports stay.
-func releaseAccountTransports(authID string) {
-	if authID == "" {
-		return
-	}
-	var pools []*utlsConnPool
-	sharedUtlsMu.Lock()
-	for key, rt := range sharedUtlsTransports {
-		if key.authID == authID {
-			pools = append(pools, rt.pool)
-			delete(sharedUtlsTransports, key)
-		}
-	}
-	sharedUtlsMu.Unlock()
-	for _, pool := range pools {
-		pool.closeAll()
-	}
-
-	var transports []*http.Transport
-	sharedProxyMu.Lock()
-	for key, transport := range sharedProxyTransports {
-		if key.authID == authID {
-			transports = append(transports, transport)
-			delete(sharedProxyTransports, key)
-		}
-	}
-	sharedProxyMu.Unlock()
-	for _, transport := range transports {
-		transport.CloseIdleConnections()
-	}
-}
 
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
 // proxyURL ("" dials directly) used without an account, such as login flows.
@@ -197,16 +162,15 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			t.pool.dropIfSilent(conn, readAtStart)
 			return nil, err
 		}
-		if err.Error() == errTextConnNotEstablished {
-			t.pool.MarkDead(conn.cc)
-			return nil, err
-		}
 		switch {
 		case serverDidNotProcess(err) && retry < maxUnprocessedRetries:
 		case !replayed && mayHaveBeenProcessed(err) && safeToSendTwice(req):
 			replayed = true
 		default:
 			return nil, err
+		}
+		if waitErr := waitBeforeRetry(req.Context(), retryBackoff(retry)); waitErr != nil {
+			return nil, waitErr
 		}
 		next, ok := rewoundRequest(req)
 		if !ok {
@@ -216,11 +180,38 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 }
 
+// retryBackoff is the wait before the retry that follows attempt retry; tests replace it.
+var retryBackoff = xnetRetryBackoff
+
+// xnetRetryBackoff is x/net's schedule: no wait before the first retry, then 1s, 2s, 4s... plus
+// up to 10% jitter. It waits before a request is sent, never on an open stream.
+func xnetRetryBackoff(retry int) time.Duration {
+	if retry == 0 {
+		return 0
+	}
+	backoff := float64(time.Second) * float64(uint(1)<<(uint(retry)-1))
+	return time.Duration(backoff + backoff*0.1*rand.Float64())
+}
+
+func waitBeforeRetry(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // http2 does not export these errors; they are matched by text.
 const (
-	errTextConnUnusable       = "http2: client conn not usable"
-	errTextConnGotGoAway      = "http2: Transport received Server's graceful shutdown GOAWAY"
-	errTextConnNotEstablished = "http2: client conn could not be established"
+	errTextConnUnusable  = "http2: client conn not usable"
+	errTextConnGotGoAway = "http2: Transport received Server's graceful shutdown GOAWAY"
+	errTextFromPeer      = "received from peer"
 )
 
 // serverDidNotProcess reports an error after which the server cannot have acted on the request:
@@ -235,13 +226,15 @@ func serverDidNotProcess(err error) bool {
 }
 
 // mayHaveBeenProcessed reports a failure that is often transient but leaves unknown whether the
-// server acted on the request: an abrupt close before the response, or a peer PROTOCOL_ERROR.
+// server acted on the request: an abrupt close before the response, or a PROTOCOL_ERROR reset
+// sent by the server. A PROTOCOL_ERROR raised locally, such as on a malformed response, means
+// the server already answered, so it is not one.
 func mayHaveBeenProcessed(err error) bool {
 	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 		return true
 	}
 	var se http2.StreamError
-	return errors.As(err, &se) && se.Code == http2.ErrCodeProtocol
+	return errors.As(err, &se) && se.Code == http2.ErrCodeProtocol && se.Cause != nil && se.Cause.Error() == errTextFromPeer
 }
 
 // safeToSendTwice reports an idempotent method, or an idempotency key as net/http allows.
@@ -408,20 +401,6 @@ func (p *utlsConnPool) dropIfSilent(conn *utlsPooledConn, readAtStart uint64) {
 	}
 	p.MarkDead(conn.cc)
 	go func() { _ = conn.cc.Shutdown(context.Background()) }()
-}
-
-// closeAll forgets every connection and shuts each down once its streams finish.
-func (p *utlsConnPool) closeAll() {
-	p.mu.Lock()
-	var conns []*utlsPooledConn
-	for _, list := range p.conns {
-		conns = append(conns, list...)
-	}
-	p.conns = map[string][]*utlsPooledConn{}
-	p.mu.Unlock()
-	for _, conn := range conns {
-		go func() { _ = conn.cc.Shutdown(context.Background()) }()
-	}
 }
 
 // dial runs detached from any one request, so a cancelled first caller does not fail the others.

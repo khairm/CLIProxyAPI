@@ -51,7 +51,7 @@ jobs:
       - name: Race-test shared proxy connections
         run: >-
           go test -race -count=1
-          -run 'Test(UtlsClient|InvalidProxyURL|ClientsForTheSameProxy|Connect|ReleasedAccounts|EquivalentProxySettings|NewClaudeAuth|PatchAuthFileFields|ConfigHandlersRejectInvalidProxyURL|UploadAuthFileRejectsBadProxyURL)'
+          -run 'Test(UtlsClient|InvalidProxyURL|ClientsForTheSameProxy|Connect|RetryBackoff|EquivalentProxySettings|NewClaudeAuth|PatchAuthFileFields|ConfigHandlersRejectInvalidProxyURL|UploadAuthFileRejectsBadProxyURL)'
           ./internal/api/handlers/management
           ./internal/auth/claude
           ./internal/runtime/executor/helps
