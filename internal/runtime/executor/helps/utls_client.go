@@ -22,14 +22,14 @@ import (
 // utlsDialTimeout bounds proxy CONNECT plus the TLS handshake for one shared connection.
 const utlsDialTimeout = 30 * time.Second
 
-// utlsTestRootCAs is a test hook; nil means the system roots.
-var utlsTestRootCAs *x509.CertPool
-
 // One HTTP/2 transport per proxy URL for the whole process, so requests share
-// connections instead of leaving one idle tunnel per request.
+// connections instead of leaving one idle tunnel per request. Proxy URLs come
+// from config, so the map is not evicted.
 var (
 	sharedUtlsMu         sync.Mutex
 	sharedUtlsTransports = map[string]*http2.Transport{}
+	// utlsTestRootCAs is a test hook guarded by sharedUtlsMu; nil means the system roots.
+	utlsTestRootCAs *x509.CertPool
 )
 
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
@@ -37,7 +37,7 @@ var (
 func UtlsTransport(proxyURL string) http.RoundTripper {
 	rt, err := sharedUtlsTransport(proxyURL)
 	if err != nil {
-		return errorRoundTripper{err: err}
+		return proxyutil.FailingTransport(err)
 	}
 	return rt
 }
@@ -54,6 +54,7 @@ func sharedUtlsTransport(proxyURL string) (*http2.Transport, error) {
 	}
 	pool := &utlsConnPool{
 		dialer:  dialer,
+		rootCAs: utlsTestRootCAs,
 		conns:   map[string][]*http2.ClientConn{},
 		dialing: map[string]*utlsDial{},
 	}
@@ -88,6 +89,7 @@ func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
 type utlsConnPool struct {
 	h2      *http2.Transport
 	dialer  proxy.ContextDialer
+	rootCAs *x509.CertPool
 	mu      sync.Mutex
 	conns   map[string][]*http2.ClientConn
 	dialing map[string]*utlsDial
@@ -175,7 +177,7 @@ func (p *utlsConnPool) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 	if err != nil {
 		return nil, err
 	}
-	tlsConn := tls.UClient(conn, &tls.Config{ServerName: host, RootCAs: utlsTestRootCAs}, tls.HelloChrome_Auto)
+	tlsConn := tls.UClient(conn, &tls.Config{ServerName: host, RootCAs: p.rootCAs}, tls.HelloChrome_Auto)
 	if err = tlsConn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -186,10 +188,6 @@ func (p *utlsConnPool) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 	}
 	return tlsConn, nil
 }
-
-type errorRoundTripper struct{ err error }
-
-func (e errorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
 
 // utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
 // to bypass Cloudflare's TLS fingerprinting.

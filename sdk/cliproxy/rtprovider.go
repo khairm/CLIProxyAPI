@@ -1,13 +1,13 @@
 package cliproxy
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
@@ -38,8 +38,8 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
 	if errBuild != nil {
-		log.Errorf("%v", errBuild)
-		return nil
+		// Fail every request rather than silently bypassing the configured proxy; not cached.
+		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyStr), errBuild))
 	}
 	if transport == nil {
 		return nil

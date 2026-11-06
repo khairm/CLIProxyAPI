@@ -57,6 +57,7 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 }
 
 // One transport per proxy URL for the whole process, so connections are pooled across clients.
+// Proxy URLs come from config, so the map is not evicted.
 var (
 	sharedProxyMu         sync.Mutex
 	sharedProxyTransports = map[string]*http.Transport{}
@@ -72,7 +73,7 @@ func proxyTransport(proxyURL string) http.RoundTripper {
 	}
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
-		return errorRoundTripper{err: fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errBuild)}
+		return proxyutil.FailingTransport(fmt.Errorf("invalid proxy %s: %w", proxyutil.Redact(proxyURL), errBuild))
 	}
 	sharedProxyTransports[proxyURL] = transport
 	return transport

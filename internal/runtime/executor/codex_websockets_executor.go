@@ -704,7 +704,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer, errDialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	if errDialer != nil {
+		return nil, nil, errDialer
+	}
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
@@ -791,7 +794,7 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	}
 }
 
-func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) (*websocket.Dialer, error) {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
@@ -810,22 +813,21 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	if proxyURL == "" {
-		return dialer
+		return dialer, nil
 	}
 
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
-		log.Errorf("codex websockets executor: %v", errParse)
-		return dialer
+		return nil, fmt.Errorf("websocket dialer: invalid proxy %s: %w", proxyutil.Redact(proxyURL), errParse)
 	}
 
 	switch setting.Mode {
 	case proxyutil.ModeDirect:
 		dialer.Proxy = nil
-		return dialer
+		return dialer, nil
 	case proxyutil.ModeProxy:
 	default:
-		return dialer
+		return dialer, nil
 	}
 
 	switch setting.URL.Scheme {
@@ -838,8 +840,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}
 		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
 		if errSOCKS5 != nil {
-			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
-			return dialer
+			return nil, fmt.Errorf("websocket dialer: create SOCKS5 dialer failed: %w", errSOCKS5)
 		}
 		dialer.Proxy = nil
 		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
@@ -848,10 +849,10 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	case "http", "https":
 		dialer.Proxy = http.ProxyURL(setting.URL)
 	default:
-		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
+		return nil, fmt.Errorf("websocket dialer: unsupported proxy scheme %q", setting.URL.Scheme)
 	}
 
-	return dialer
+	return dialer, nil
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {

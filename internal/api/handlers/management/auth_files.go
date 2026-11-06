@@ -1498,6 +1498,9 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			targetAuth.Metadata = make(map[string]any)
 		}
 
+		if raw, isString := value.(string); isString && fieldPath == "proxy_url" && rejectInvalidProxyURL(c, "proxy_url", raw) {
+			return
+		}
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {

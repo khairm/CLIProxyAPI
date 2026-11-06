@@ -20,6 +20,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -767,6 +768,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = cfg.ValidateCodexOAuthRouteAPIKeys(); err != nil {
 		return nil, err
 	}
+	if err = cfg.ValidateProxyURLs(); err != nil {
+		return nil, err
+	}
 
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -848,6 +852,57 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// ValidateProxyURLs rejects any malformed proxy-url, so a typo stops startup instead of failing requests later.
+func (cfg *Config) ValidateProxyURLs() error {
+	if cfg == nil {
+		return nil
+	}
+	if err := ValidateProxyURL("proxy-url", cfg.ProxyURL); err != nil {
+		return err
+	}
+	for i, k := range cfg.GeminiKey {
+		if err := ValidateProxyURL(fmt.Sprintf("gemini-api-key[%d].proxy-url", i), k.ProxyURL); err != nil {
+			return err
+		}
+	}
+	for i, k := range cfg.InteractionsKey {
+		if err := ValidateProxyURL(fmt.Sprintf("interactions-api-key[%d].proxy-url", i), k.ProxyURL); err != nil {
+			return err
+		}
+	}
+	for i, k := range cfg.CodexKey {
+		if err := ValidateProxyURL(fmt.Sprintf("codex-api-key[%d].proxy-url", i), k.ProxyURL); err != nil {
+			return err
+		}
+	}
+	for i, k := range cfg.ClaudeKey {
+		if err := ValidateProxyURL(fmt.Sprintf("claude-api-key[%d].proxy-url", i), k.ProxyURL); err != nil {
+			return err
+		}
+	}
+	for i, k := range cfg.VertexCompatAPIKey {
+		if err := ValidateProxyURL(fmt.Sprintf("vertex-api-key[%d].proxy-url", i), k.ProxyURL); err != nil {
+			return err
+		}
+	}
+	for i, compat := range cfg.OpenAICompatibility {
+		for j, k := range compat.APIKeyEntries {
+			if err := ValidateProxyURL(fmt.Sprintf("openai-compatibility[%d].api-key-entries[%d].proxy-url", i, j), k.ProxyURL); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateProxyURL returns an error naming field when raw is set but is not a usable proxy setting.
+func ValidateProxyURL(field, raw string) error {
+	if _, err := proxyutil.Parse(raw); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
 }
 
 // NormalizeCodexOAuthBaseURL validates and normalizes the optional Codex OAuth upstream URL.

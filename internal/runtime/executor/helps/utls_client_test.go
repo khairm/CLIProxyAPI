@@ -94,8 +94,11 @@ func startChatgptServer(t *testing.T, h2 bool, handler http.Handler) *httptest.S
 			panic(err)
 		}
 		chatgptCert = stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
-		utlsTestRootCAs = x509.NewCertPool()
-		utlsTestRootCAs.AddCert(leaf)
+		roots := x509.NewCertPool()
+		roots.AddCert(leaf)
+		sharedUtlsMu.Lock()
+		utlsTestRootCAs = roots
+		sharedUtlsMu.Unlock()
 	})
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = h2
@@ -398,5 +401,36 @@ func TestClientsForTheSameProxyShareTheFallbackTransport(t *testing.T) {
 	}
 	if fallback := NewUtlsHTTPClient(context.Background(), cfg, nil, 0).Transport.(*fallbackRoundTripper).fallback; fallback != first {
 		t.Fatal("utls client fallback does not share the proxy transport")
+	}
+}
+
+type closeTrackingBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *closeTrackingBody) Close() error { b.closed.Store(true); return nil }
+
+func TestInvalidProxyURLClosesTheRequestBody(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "ftp://proxy.invalid:21"}}
+
+	for name, client := range map[string]*http.Client{
+		"utls":        NewUtlsHTTPClient(context.Background(), cfg, nil, 0),
+		"proxy-aware": NewProxyAwareHTTPClient(context.Background(), cfg, nil, 0),
+	} {
+		for _, url := range []string{"https://chatgpt.com/", "https://example.com/"} {
+			body := &closeTrackingBody{Reader: strings.NewReader("payload")}
+			req, err := http.NewRequest(http.MethodPost, url, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = client.Do(req); err == nil {
+				t.Fatalf("%s %s: expected invalid proxy error", name, url)
+			}
+			if !body.closed.Load() {
+				t.Fatalf("%s %s: request body left open", name, url)
+			}
+		}
 	}
 }

@@ -45,6 +45,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if err := cfg.ValidateCodexOAuthRouteAPIKeys(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateProxyURLs(); err != nil {
+		return nil, err
+	}
 
 	// Hash remote management key if plaintext is detected (nested), but do NOT persist.
 	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {

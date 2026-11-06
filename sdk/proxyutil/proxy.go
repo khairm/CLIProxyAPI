@@ -213,10 +213,9 @@ func (d *httpConnectDialer) connect(ctx context.Context, proxyConn net.Conn, add
 	if errRead != nil {
 		return nil, fmt.Errorf("read CONNECT response failed: %w", contextError(ctx, errRead))
 	}
-	if resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if resp.StatusCode != http.StatusOK {
+	// RFC 9110 9.3.6: a 2xx CONNECT reply has no body, so never read resp.Body; bytes after the headers belong to the tunnel.
+	// A rejected CONNECT is not drained: the caller closes the socket.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("proxy CONNECT returned status %s", resp.Status)
 	}
 
@@ -233,9 +232,13 @@ func (d *httpConnectDialer) connect(ctx context.Context, proxyConn net.Conn, add
 }
 
 // contextError prefers the context's error when the I/O failed because ctx ended.
+// The conn deadline can fire just before ctx records its own expiry, so a passed deadline counts too.
 func contextError(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
 	}
 	return err
 }
@@ -290,4 +293,17 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 		return c.reader.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+// FailingTransport returns a RoundTripper that fails every request with err, for a proxy
+// setting that cannot be used; it closes the request body as the RoundTripper contract requires.
+func FailingTransport(err error) http.RoundTripper { return failingTransport{err: err} }
+
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return nil, f.err
 }
