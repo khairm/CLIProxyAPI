@@ -6015,7 +6015,17 @@ func authAccessToken(auth *Auth) string {
 	return authMetadataString(auth, "accessToken")
 }
 
+// authRefreshedExternally reports a credential that account-pilot keeps fresh from
+// the Pi. Its file carries a placeholder refresh token, so refreshing it here can
+// only fail and mark the auth unauthorized.
+func authRefreshedExternally(auth *Auth) bool {
+	return authMetadataString(auth, "trayManagedAccount") != ""
+}
+
 func authHasRefreshCredential(auth *Auth) bool {
+	if authRefreshedExternally(auth) {
+		return false
+	}
 	if authMetadataString(auth, "refresh_token") != "" {
 		return true
 	}
