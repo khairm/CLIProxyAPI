@@ -3,8 +3,10 @@ package helps
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,146 +15,181 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
-type utlsRoundTripper struct {
-	mu          sync.Mutex
-	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
-	dialer      proxy.Dialer
-	h2          *http2.Transport
-	rootCAs     *x509.CertPool
-}
+// utlsDialTimeout bounds proxy CONNECT plus the TLS handshake for one shared connection.
+const utlsDialTimeout = 30 * time.Second
 
-// One round tripper per proxy URL for the whole process, so requests reuse
-// HTTP/2 connections instead of leaving one idle tunnel per request.
+// utlsTestRootCAs is a test hook; nil means the system roots.
+var utlsTestRootCAs *x509.CertPool
+
+// One HTTP/2 transport per proxy URL for the whole process, so requests share
+// connections instead of leaving one idle tunnel per request.
 var (
-	sharedUtlsMu  sync.Mutex
-	sharedUtlsRTs = map[string]*utlsRoundTripper{}
+	sharedUtlsMu         sync.Mutex
+	sharedUtlsTransports = map[string]*http2.Transport{}
 )
 
-func sharedUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
-	sharedUtlsMu.Lock()
-	defer sharedUtlsMu.Unlock()
-	rt, ok := sharedUtlsRTs[proxyURL]
-	if !ok {
-		rt = newUtlsRoundTripper(proxyURL)
-		sharedUtlsRTs[proxyURL] = rt
+// UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
+// proxyURL ("" dials directly). An invalid proxy URL yields a transport that fails every request.
+func UtlsTransport(proxyURL string) http.RoundTripper {
+	rt, err := sharedUtlsTransport(proxyURL)
+	if err != nil {
+		return errorRoundTripper{err: err}
 	}
 	return rt
 }
 
-func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
-	var dialer proxy.Dialer = proxy.Direct
-	if proxyURL != "" {
-		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
-		if errBuild != nil {
-			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
-		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
-			dialer = proxyDialer
+func sharedUtlsTransport(proxyURL string) (*http2.Transport, error) {
+	sharedUtlsMu.Lock()
+	defer sharedUtlsMu.Unlock()
+	if rt, ok := sharedUtlsTransports[proxyURL]; ok {
+		return rt, nil
+	}
+	dialer, err := utlsDialer(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	pool := &utlsConnPool{
+		dialer:  dialer,
+		conns:   map[string][]*http2.ClientConn{},
+		dialing: map[string]*utlsDial{},
+	}
+	rt := &http2.Transport{
+		ConnPool:        pool,
+		IdleConnTimeout: 90 * time.Second,
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     15 * time.Second,
+	}
+	pool.h2 = rt
+	sharedUtlsTransports[proxyURL] = rt
+	return rt, nil
+}
+
+func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
+	if proxyURL == "" {
+		return proxy.Direct, nil
+	}
+	dialer, _, err := proxyutil.BuildDialer(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("utls: invalid proxy %s: %w", proxyutil.Redact(proxyURL), err)
+	}
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("utls: proxy %s has no cancellable dialer (%T)", proxyutil.Redact(proxyURL), dialer)
+	}
+	return contextDialer, nil
+}
+
+// utlsConnPool is an http2.ClientConnPool that dials once per address and lets
+// each waiting request give up when its own context ends.
+type utlsConnPool struct {
+	h2      *http2.Transport
+	dialer  proxy.ContextDialer
+	mu      sync.Mutex
+	conns   map[string][]*http2.ClientConn
+	dialing map[string]*utlsDial
+}
+
+type utlsDial struct {
+	done chan struct{}
+	cc   *http2.ClientConn
+	err  error
+}
+
+func (p *utlsConnPool) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
+	for {
+		p.mu.Lock()
+		for _, cc := range p.conns[addr] {
+			if cc.ReserveNewRequest() {
+				p.mu.Unlock()
+				return cc, nil
+			}
+		}
+		d, ok := p.dialing[addr]
+		if !ok {
+			d = &utlsDial{done: make(chan struct{})}
+			p.dialing[addr] = d
+			go p.dial(d, addr)
+		}
+		p.mu.Unlock()
+
+		select {
+		case <-d.done:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+		if d.err != nil {
+			return nil, d.err
+		}
+		if d.cc.ReserveNewRequest() {
+			return d.cc, nil
 		}
 	}
-	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      dialer,
-		h2: &http2.Transport{
-			IdleConnTimeout: 90 * time.Second,
-			ReadIdleTimeout: 30 * time.Second,
-			PingTimeout:     15 * time.Second,
-		},
-	}
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
-
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
-	}
-
-	if cond, ok := t.pending[host]; ok {
-		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
+func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for addr, list := range p.conns {
+		if i := slices.Index(list, cc); i >= 0 {
+			if list = slices.Delete(list, i, i+1); len(list) == 0 {
+				delete(p.conns, addr)
+			} else {
+				p.conns[addr] = list
+			}
+			return
 		}
 	}
-
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
-	}
-
-	t.connections[host] = h2Conn
-	return h2Conn, nil
 }
 
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
-	conn, err := t.dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	tlsConfig := &tls.Config{ServerName: host, RootCAs: t.rootCAs}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
-
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	h2Conn, err := t.h2.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-
-	return h2Conn, nil
-}
-
-func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	hostname := req.URL.Hostname()
-	port := req.URL.Port()
-	if port == "" {
-		port = "443"
-	}
-	addr := net.JoinHostPort(hostname, port)
-
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h2Conn.RoundTrip(req)
-	if err != nil {
-		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
+// dial runs detached from any one request, so a cancelled first caller does not fail the others.
+func (p *utlsConnPool) dial(d *utlsDial, addr string) {
+	ctx, cancel := context.WithTimeout(context.Background(), utlsDialTimeout)
+	defer cancel()
+	conn, err := p.dialTLS(ctx, addr)
+	if err == nil {
+		if d.cc, err = p.h2.NewClientConn(conn); err != nil {
+			_ = conn.Close()
 		}
-		t.mu.Unlock()
+	}
+	d.err = err
+
+	p.mu.Lock()
+	delete(p.dialing, addr)
+	if err == nil {
+		p.conns[addr] = append(p.conns[addr], d.cc)
+	}
+	p.mu.Unlock()
+	close(d.done)
+}
+
+func (p *utlsConnPool) dialTLS(ctx context.Context, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
 		return nil, err
 	}
-
-	return resp, nil
+	conn, err := p.dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn := tls.UClient(conn, &tls.Config{ServerName: host, RootCAs: utlsTestRootCAs}, tls.HelloChrome_Auto)
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != http2.NextProtoTLS {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("utls: %s negotiated ALPN %q, want %q", addr, proto, http2.NextProtoTLS)
+	}
+	return tlsConn, nil
 }
+
+type errorRoundTripper struct{ err error }
+
+func (e errorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
 
 // utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
 // to bypass Cloudflare's TLS fingerprinting.
@@ -194,12 +231,10 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = sharedUtlsRoundTripper(proxyURL)
+	utlsRT := UtlsTransport(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			standardTransport = transport
-		}
+		standardTransport = proxyTransport(proxyURL)
 	} else if ctxRoundTripper != nil {
 		utlsRT = ctxRoundTripper
 		standardTransport = ctxRoundTripper
