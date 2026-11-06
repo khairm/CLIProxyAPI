@@ -158,6 +158,11 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			return resp, nil
 		}
 		body.Close()
+		if err.Error() == errTextConnNotEstablished {
+			// x/net leaves a conn that died before its first stream reservable; drop it so the next request redials.
+			t.pool.MarkDead(conn.cc)
+			return nil, err
+		}
 		if req.Context().Err() != nil {
 			t.pool.dropIfSilent(conn, readAtStart)
 			return nil, err
@@ -169,12 +174,13 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		default:
 			return nil, err
 		}
-		if waitErr := waitBeforeRetry(req.Context(), retryBackoff(retry)); waitErr != nil {
-			return nil, waitErr
+		next, rewindErr := rewoundRequest(req, err)
+		if rewindErr != nil {
+			return nil, rewindErr
 		}
-		next, ok := rewoundRequest(req)
-		if !ok {
-			return nil, err
+		if waitErr := waitBeforeRetry(req.Context(), retryBackoff(retry)); waitErr != nil {
+			closeRequestBody(next)
+			return nil, waitErr
 		}
 		req = next
 	}
@@ -209,9 +215,10 @@ func waitBeforeRetry(ctx context.Context, d time.Duration) error {
 
 // http2 does not export these errors; they are matched by text.
 const (
-	errTextConnUnusable  = "http2: client conn not usable"
-	errTextConnGotGoAway = "http2: Transport received Server's graceful shutdown GOAWAY"
-	errTextFromPeer      = "received from peer"
+	errTextConnUnusable       = "http2: client conn not usable"
+	errTextConnGotGoAway      = "http2: Transport received Server's graceful shutdown GOAWAY"
+	errTextConnNotEstablished = "http2: client conn could not be established"
+	errTextFromPeer           = "received from peer"
 )
 
 // serverDidNotProcess reports an error after which the server cannot have acted on the request:
@@ -246,21 +253,22 @@ func safeToSendTwice(req *http.Request) bool {
 	return req.Header.Get("Idempotency-Key") != "" || req.Header.Get("X-Idempotency-Key") != ""
 }
 
-// rewoundRequest returns a copy of req with its body back at the start, when that is possible.
-func rewoundRequest(req *http.Request) (*http.Request, bool) {
+// rewoundRequest returns a copy of req with its body back at the start. Without GetBody it
+// returns cause, the error that prompted the retry; a failing GetBody returns its own error.
+func rewoundRequest(req *http.Request, cause error) (*http.Request, error) {
 	next := req.Clone(req.Context())
 	if req.Body == nil || req.Body == http.NoBody {
-		return next, true
+		return next, nil
 	}
 	if req.GetBody == nil {
-		return nil, false
+		return nil, cause
 	}
 	body, err := req.GetBody()
 	if err != nil {
-		return nil, false
+		return nil, fmt.Errorf("utls: rewinding the request body after %v: %w", cause, err)
 	}
 	next.Body = body
-	return next, true
+	return next, nil
 }
 
 // onceClosedBody lets both http2 and the round tripper close an attempt's body, closing it once.

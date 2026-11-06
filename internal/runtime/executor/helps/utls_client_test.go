@@ -921,3 +921,123 @@ func TestInvalidProxyURLClosesTheRequestBody(t *testing.T) {
 		}
 	}
 }
+
+// startFlakyFirstConnServer serves healthy HTTP/2 except on its first connection, which it
+// closes right after the TLS handshake, before any stream.
+func startFlakyFirstConnServer(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	startChatgptServer(t, true, http.NotFoundHandler())
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", &stdtls.Config{Certificates: []stdtls.Certificate{chatgptCert}, NextProtos: []string{"h2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	var accepted atomic.Int32
+	h2s := &http2.Server{}
+	go func() {
+		for {
+			conn, errAccept := ln.Accept()
+			if errAccept != nil {
+				return
+			}
+			first := accepted.Add(1) == 1
+			go func() {
+				if errHandshake := conn.(*stdtls.Conn).Handshake(); errHandshake != nil || first {
+					_ = conn.Close()
+					return
+				}
+				h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(writeProto)})
+			}()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	return "https://chatgpt.com:" + port + "/", &accepted
+}
+
+func TestReviewNotEstablishedConnIsReused(t *testing.T) {
+	t.Parallel()
+	url, accepted := startFlakyFirstConnServer(t)
+	proxy := startConnectProxy(t, false)
+
+	// A caller that gives up at once leaves the shared dial to finish on its own, so the pool
+	// holds a conn the server closes before its first stream.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	_, _ = getBody(ctx, proxy.url, url)
+	cancel()
+	time.Sleep(300 * time.Millisecond)
+
+	fails := 0
+	for i := 0; i < 20; i++ {
+		if _, err := getBody(context.Background(), proxy.url, url); err == nil {
+			if fails > 1 {
+				t.Fatalf("%d requests failed on the dead conn before one redialled", fails)
+			}
+			if accepted.Load() < 2 {
+				t.Fatal("request succeeded without a new connection")
+			}
+			return
+		}
+		fails++
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("all %d requests failed on a conn that died before its first stream; none redialled", fails)
+}
+
+func TestUtlsClientWaitsBeforeRetryingAndStopsWhenCancelled(t *testing.T) {
+	old := retryBackoff
+	retryBackoff = func(int) time.Duration { return time.Hour }
+	defer func() { retryBackoff = old }()
+	server := startRawH2Server(t, func(int32) h2Action { return h2RefuseStream })
+	proxy := startConnectProxy(t, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	body := &closeTrackingBody{Reader: strings.NewReader("payload")}
+	rewound := &closeTrackingBody{Reader: strings.NewReader("payload")}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.url("/"), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return rewound, nil }
+
+	start := time.Now()
+	err = doRequest(proxy.url, req)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the request's deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("returned after %v; the cancelled wait did not stop", elapsed)
+	}
+	if hits := server.hits.Load(); hits != 1 {
+		t.Fatalf("server hits = %d, want 1: the retry did not wait", hits)
+	}
+	if !body.closed.Load() || !rewound.closed.Load() {
+		t.Fatalf("bodies left open: original closed=%v, rewound closed=%v", body.closed.Load(), rewound.closed.Load())
+	}
+}
+
+func TestUtlsClientReturnsTheRewindErrorWithoutWaiting(t *testing.T) {
+	old := retryBackoff
+	retryBackoff = func(int) time.Duration { return time.Hour }
+	defer func() { retryBackoff = old }()
+	server := startRawH2Server(t, func(int32) h2Action { return h2RefuseStream })
+	proxy := startConnectProxy(t, false)
+
+	errRewind := errors.New("payload gone")
+	req, err := http.NewRequest(http.MethodPost, server.url("/"), io.NopCloser(strings.NewReader("payload")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return nil, errRewind }
+
+	done := make(chan error, 1)
+	go func() { done <- doRequest(proxy.url, req) }()
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waited for the retry before finding the body could not be rewound")
+	}
+	if !errors.Is(err, errRewind) {
+		t.Fatalf("err = %v, want the rewind error", err)
+	}
+}
