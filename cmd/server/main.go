@@ -41,7 +41,7 @@ import (
 )
 
 var (
-	Version           = "7.2.62+edgee.9"
+	Version           = "7.2.62+edgee.10"
 	Commit            = "none"
 	BuildDate         = "unknown"
 	DefaultConfigPath = ""
