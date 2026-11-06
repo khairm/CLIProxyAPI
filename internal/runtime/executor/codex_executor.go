@@ -1179,6 +1179,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				markCodexResponseComplete(httpResp.Body, data)
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
@@ -1231,6 +1232,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func markCodexResponseComplete(body io.ReadCloser, data []byte) {
+	switch gjson.GetBytes(data, "type").String() {
+	case "response.completed", "response.incomplete", "response.failed":
+		helps.MarkResponseComplete(body)
+	}
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
