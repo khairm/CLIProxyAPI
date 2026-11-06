@@ -1063,20 +1063,18 @@ func TestUtlsClientReturnsTheRewindErrorWithoutWaiting(t *testing.T) {
 	}
 }
 
-// pooledConns returns the account-less shared connections for proxyURL.
-func pooledConns(t *testing.T, proxyURL string) []*utlsPooledConn {
+// pooledConns returns the account-less shared connections to server through proxyURL. Keying by
+// the test's own server keeps a reused proxy port from mixing in another test's connections.
+func pooledConns(t *testing.T, proxyURL string, server *httptest.Server) []*utlsPooledConn {
 	t.Helper()
 	rt, err := sharedUtlsTransport(proxyURL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, port, _ := net.SplitHostPort(server.Listener.Addr().String())
 	rt.pool.mu.Lock()
 	defer rt.pool.mu.Unlock()
-	var out []*utlsPooledConn
-	for _, list := range rt.pool.conns {
-		out = append(out, list...)
-	}
-	return out
+	return slices.Clone(rt.pool.conns[net.JoinHostPort("chatgpt.com", port)])
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -1158,7 +1156,7 @@ func TestUtlsClientClosesARetiredConnectionStuckBehindAFullSendBuffer(t *testing
 	if _, err := getBody(context.Background(), p.url, url); err != nil {
 		t.Fatal(err)
 	}
-	conns := pooledConns(t, p.url)
+	conns := pooledConns(t, p.url, server)
 	if len(conns) != 1 {
 		t.Fatalf("pooled conns = %d, want 1", len(conns))
 	}
@@ -1189,7 +1187,7 @@ func TestUtlsClientDropsClosedConnectionsFromThePool(t *testing.T) {
 	if _, err := getBody(context.Background(), p.url, url); err != nil {
 		t.Fatal(err)
 	}
-	first := pooledConns(t, p.url)
+	first := pooledConns(t, p.url, server)
 	if len(first) != 1 {
 		t.Fatalf("pooled conns = %d, want 1", len(first))
 	}
@@ -1198,7 +1196,7 @@ func TestUtlsClientDropsClosedConnectionsFromThePool(t *testing.T) {
 	if _, err := getBody(context.Background(), p.url, url); err != nil {
 		t.Fatal(err)
 	}
-	if got := pooledConns(t, p.url); len(got) != 1 || got[0] == first[0] {
+	if got := pooledConns(t, p.url, server); len(got) != 1 || got[0] == first[0] {
 		t.Fatalf("pool after the cut = %d conns (closed one kept: %v), want only the new one", len(got), slices.Contains(got, first[0]))
 	}
 }
@@ -1232,7 +1230,7 @@ func TestUtlsClientReplaysOnlySafeRequestsAfterAForcedClose(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- doRequest(p.url, req) }()
 			<-arrived
-			conns := pooledConns(t, p.url)
+			conns := pooledConns(t, p.url, server)
 			if len(conns) != 1 {
 				t.Fatalf("pooled conns = %d, want 1", len(conns))
 			}
@@ -1353,7 +1351,7 @@ func TestUtlsClientNeverReservesARetiredConnection(t *testing.T) {
 	if _, err := getBody(context.Background(), p.url, chatgptURL(server, "/")); err != nil {
 		t.Fatal(err)
 	}
-	conns := pooledConns(t, p.url)
+	conns := pooledConns(t, p.url, server)
 	if len(conns) != 1 {
 		t.Fatalf("pooled conns = %d, want 1", len(conns))
 	}
@@ -1370,4 +1368,9 @@ func TestUtlsClientNeverReservesARetiredConnection(t *testing.T) {
 	}
 	conn.done()
 	waitFor(t, "the retired conn to close", func() bool { return p.open.Load() == 0 })
+	rt, err := sharedUtlsTransport(p.url, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.pool.MarkDead(conn.cc)
 }
