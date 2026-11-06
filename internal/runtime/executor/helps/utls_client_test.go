@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
@@ -518,7 +519,7 @@ func TestUtlsClientNamesSharedDialFailures(t *testing.T) {
 func TestEquivalentProxySettingsShareOneTransport(t *testing.T) {
 	t.Parallel()
 	same := func(a, b string) bool {
-		return UtlsTransport(a) == UtlsTransport(b) && proxyTransport(a) == proxyTransport(b)
+		return UtlsTransport(a) == UtlsTransport(b) && proxyTransport(a, "") == proxyTransport(b, "")
 	}
 	if !same("http://127.0.0.1:10", " HTTP://127.0.0.1:10/ ") {
 		t.Fatal("equivalent proxy URLs got separate transports")
@@ -528,6 +529,29 @@ func TestEquivalentProxySettingsShareOneTransport(t *testing.T) {
 	}
 	if same("http://127.0.0.1:10", "http://127.0.0.1:11") {
 		t.Fatal("different proxies share a transport")
+	}
+}
+
+func TestUtlsClientKeepsOneConnectionPerAccount(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: p.url}}
+
+	for _, id := range []string{"account-a", "account-b", "account-a", "account-b", "account-a"} {
+		resp, err := NewUtlsHTTPClient(context.Background(), cfg, &cliproxyauth.Auth{ID: id}, 0).Get(chatgptURL(server, "/"))
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	if got := p.opened.Load(); got != 2 {
+		t.Fatalf("tunnels opened = %d, want one per account", got)
+	}
+	if NewProxyAwareHTTPClient(context.Background(), cfg, &cliproxyauth.Auth{ID: "account-a"}, 0).Transport ==
+		NewProxyAwareHTTPClient(context.Background(), cfg, &cliproxyauth.Auth{ID: "account-b"}, 0).Transport {
+		t.Fatal("two accounts share the fallback transport")
 	}
 }
 
@@ -559,15 +583,15 @@ func TestInvalidProxyURLFailsEveryRequestAndIsNotCached(t *testing.T) {
 	}
 	sharedUtlsMu.Lock()
 	for key := range sharedUtlsTransports {
-		if strings.Contains(key, "proxy.invalid") {
-			t.Errorf("invalid proxy cached in utls transports: %s", key)
+		if strings.Contains(key.proxy, "proxy.invalid") {
+			t.Errorf("invalid proxy cached in utls transports: %s", key.proxy)
 		}
 	}
 	sharedUtlsMu.Unlock()
 	sharedProxyMu.Lock()
 	for key := range sharedProxyTransports {
-		if strings.Contains(key, "proxy.invalid") {
-			t.Errorf("invalid proxy cached in proxy transports: %s", key)
+		if strings.Contains(key.proxy, "proxy.invalid") {
+			t.Errorf("invalid proxy cached in proxy transports: %s", key.proxy)
 		}
 	}
 	sharedProxyMu.Unlock()

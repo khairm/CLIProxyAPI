@@ -27,27 +27,33 @@ import (
 // utlsDialTimeout bounds proxy CONNECT plus the TLS handshake for one shared connection.
 const utlsDialTimeout = 30 * time.Second
 
-// One HTTP/2 transport per proxy for the whole process, so requests share connections
-// instead of leaving one idle tunnel per request. Proxy URLs come from config, so the map is not evicted.
+// One HTTP/2 transport per proxy and account for the whole process, so requests share
+// connections instead of leaving one idle tunnel per request, and accounts never share one.
+// Proxy URLs and accounts come from config, so the map is not evicted.
 var (
 	sharedUtlsMu         sync.Mutex
-	sharedUtlsTransports = map[string]*utlsRoundTripper{}
+	sharedUtlsTransports = map[transportKey]*utlsRoundTripper{}
 	// utlsTestRootCAs is a test hook guarded by sharedUtlsMu; nil means the system roots.
 	utlsTestRootCAs *x509.CertPool
 )
 
 // UtlsTransport returns the process-wide Chrome-fingerprinted HTTP/2 transport for
-// proxyURL ("" dials directly). An invalid proxy URL yields a transport that fails every request.
+// proxyURL ("" dials directly) used without an account, such as login flows.
+// An invalid proxy URL yields a transport that fails every request.
 func UtlsTransport(proxyURL string) http.RoundTripper {
-	rt, err := sharedUtlsTransport(proxyURL)
+	return utlsTransportFor(proxyURL, "")
+}
+
+func utlsTransportFor(proxyURL, authID string) http.RoundTripper {
+	rt, err := sharedUtlsTransport(proxyURL, authID)
 	if err != nil {
 		return proxyutil.FailingTransport(err)
 	}
 	return rt
 }
 
-func sharedUtlsTransport(proxyURL string) (*utlsRoundTripper, error) {
-	key, err := proxyPoolKey(proxyURL)
+func sharedUtlsTransport(proxyURL, authID string) (*utlsRoundTripper, error) {
+	key, err := newTransportKey(proxyURL, authID)
 	if err != nil {
 		return nil, fmt.Errorf("utls: invalid proxy %s: %w", proxyutil.Redact(proxyURL), err)
 	}
@@ -74,18 +80,24 @@ func sharedUtlsTransport(proxyURL string) (*utlsRoundTripper, error) {
 	return rt, nil
 }
 
-// proxyPoolKey names the pool for a proxy setting: "direct" for no proxy, otherwise the
-// proxy URL without path or case differences, so equivalent settings share one pool.
-func proxyPoolKey(raw string) (string, error) {
-	setting, err := proxyutil.Parse(raw)
+// transportKey names a shared transport: the proxy ("direct" for none, otherwise the proxy
+// URL without path or case differences) and the account ("" when there is none).
+type transportKey struct {
+	proxy  string
+	authID string
+}
+
+func newTransportKey(proxyURL, authID string) (transportKey, error) {
+	setting, err := proxyutil.Parse(proxyURL)
 	if err != nil {
-		return "", err
+		return transportKey{}, err
 	}
-	if setting.Mode != proxyutil.ModeProxy {
-		return "direct", nil
+	key := transportKey{proxy: "direct", authID: authID}
+	if setting.Mode == proxyutil.ModeProxy {
+		normalised := url.URL{Scheme: setting.URL.Scheme, User: setting.URL.User, Host: strings.ToLower(setting.URL.Host)}
+		key.proxy = normalised.String()
 	}
-	key := url.URL{Scheme: setting.URL.Scheme, User: setting.URL.User, Host: strings.ToLower(setting.URL.Host)}
-	return key.String(), nil
+	return key, nil
 }
 
 func utlsDialer(proxyURL string) (proxy.ContextDialer, error) {
@@ -361,9 +373,10 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // Use this for provider requests that need a Chrome-like TLS fingerprint.
 // Falls back to standard transport for non-HTTPS requests.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	var proxyURL string
+	var proxyURL, authID string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		authID = auth.ID
 	}
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
@@ -374,10 +387,10 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	utlsRT := UtlsTransport(proxyURL)
+	utlsRT := utlsTransportFor(proxyURL, authID)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
-		standardTransport = proxyTransport(proxyURL)
+		standardTransport = proxyTransport(proxyURL, authID)
 	} else if ctxRoundTripper != nil {
 		utlsRT = ctxRoundTripper
 		standardTransport = ctxRoundTripper
