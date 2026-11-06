@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,6 +165,23 @@ type connectProxy struct {
 type proxyTunnel struct {
 	client   net.Conn
 	dropping atomic.Bool
+	stalled  atomic.Bool
+}
+
+// stallOpenTunnels stops reading from every open tunnel's client, so the client's writes back up
+// until its TCP send buffer is full; resume reads again.
+func (p *connectProxy) stallOpenTunnels() (resume func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tunnels := slices.Clone(p.tunnels)
+	for _, tun := range tunnels {
+		tun.stalled.Store(true)
+	}
+	return func() {
+		for _, tun := range tunnels {
+			tun.stalled.Store(false)
+		}
+	}
 }
 
 // blackHoleOpenTunnels keeps every open tunnel's TCP connection up but drops its bytes.
@@ -188,6 +206,9 @@ func (p *connectProxy) closeOpenTunnels() {
 func (tun *proxyTunnel) pipe(dst, src net.Conn) {
 	buf := make([]byte, 32*1024)
 	for {
+		for src == tun.client && tun.stalled.Load() {
+			time.Sleep(5 * time.Millisecond)
+		}
 		n, err := src.Read(buf)
 		if n > 0 && !tun.dropping.Load() {
 			if _, errWrite := dst.Write(buf[:n]); errWrite != nil {
@@ -1039,5 +1060,193 @@ func TestUtlsClientReturnsTheRewindErrorWithoutWaiting(t *testing.T) {
 	}
 	if !errors.Is(err, errRewind) {
 		t.Fatalf("err = %v, want the rewind error", err)
+	}
+}
+
+// pooledConns returns the account-less shared connections for proxyURL.
+func pooledConns(t *testing.T, proxyURL string) []*utlsPooledConn {
+	t.Helper()
+	rt, err := sharedUtlsTransport(proxyURL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.pool.mu.Lock()
+	defer rt.pool.mu.Unlock()
+	var out []*utlsPooledConn
+	for _, list := range rt.pool.conns {
+		out = append(out, list...)
+	}
+	return out
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestUtlsClientRetiresSilentTunnelWhenAStreamedResponseIsCancelled(t *testing.T) {
+	t.Parallel()
+	quit := make(chan struct{})
+	server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sse" {
+			writeProto(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-quit:
+		}
+	}))
+	t.Cleanup(func() { close(quit) })
+	p := startConnectProxy(t, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, chatgptURL(server, "/sse"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := newProxiedUtlsClient(p.url).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = resp.Body.Read(make([]byte, 64)); err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	p.blackHoleOpenTunnels()
+	cancel()
+	if _, err = io.ReadAll(resp.Body); !errors.Is(err, context.Canceled) {
+		t.Fatalf("read after cancel: err = %v, want context canceled", err)
+	}
+	_ = resp.Body.Close()
+
+	next, cancelNext := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelNext()
+	if body, err := getBody(next, p.url, chatgptURL(server, "/")); err != nil || body != "HTTP/2.0" {
+		t.Fatalf("request after the silent stream: body=%q err=%v", body, err)
+	}
+	if got := p.opened.Load(); got != 2 {
+		t.Fatalf("tunnels opened = %d, want a fresh tunnel after the silent one", got)
+	}
+	waitFor(t, "the silent tunnel to close", func() bool { return p.open.Load() == 1 })
+}
+
+func TestUtlsClientClosesARetiredConnectionStuckBehindAFullSendBuffer(t *testing.T) {
+	t.Parallel()
+	startChatgptServer(t, true, http.NotFoundHandler()) // installs the chatgpt.com cert and test roots
+	// Large flow-control windows let the client write until its TCP send buffer is full.
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		writeProto(w, r)
+	}))
+	server.EnableHTTP2 = true
+	server.Config.HTTP2 = &http.HTTP2Config{MaxReceiveBufferPerConnection: 64 << 20, MaxReceiveBufferPerStream: 64 << 20}
+	server.TLS = &stdtls.Config{Certificates: []stdtls.Certificate{chatgptCert}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
+	conns := pooledConns(t, p.url)
+	if len(conns) != 1 {
+		t.Fatalf("pooled conns = %d, want 1", len(conns))
+	}
+	resume := p.stallOpenTunnels()
+	defer resume()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(make([]byte, 48<<20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = doRequest(p.url, req); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("POST on the stalled tunnel: err = %v, want context deadline exceeded", err)
+	}
+	waitFor(t, "the retired connection's socket to close", conns[0].dead.Load)
+	if body, err := getBody(context.Background(), p.url, url); err != nil || body != "HTTP/2.0" {
+		t.Fatalf("request after the stalled tunnel: body=%q err=%v", body, err)
+	}
+}
+
+func TestUtlsClientDropsClosedConnectionsFromThePool(t *testing.T) {
+	t.Parallel()
+	server := startChatgptServer(t, true, http.HandlerFunc(writeProto))
+	p := startConnectProxy(t, false)
+	url := chatgptURL(server, "/")
+
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
+	first := pooledConns(t, p.url)
+	if len(first) != 1 {
+		t.Fatalf("pooled conns = %d, want 1", len(first))
+	}
+	p.closeOpenTunnels()
+	waitFor(t, "the cut connection to be seen as closed", first[0].dead.Load)
+	if _, err := getBody(context.Background(), p.url, url); err != nil {
+		t.Fatal(err)
+	}
+	if got := pooledConns(t, p.url); len(got) != 1 || got[0] == first[0] {
+		t.Fatalf("pool after the cut = %d conns (closed one kept: %v), want only the new one", len(got), slices.Contains(got, first[0]))
+	}
+}
+
+func TestUtlsClientReplaysOnlySafeRequestsAfterAForcedClose(t *testing.T) {
+	t.Parallel()
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int32
+			arrived := make(chan struct{}, 1)
+			quit := make(chan struct{})
+			server := startChatgptServer(t, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if hits.Add(1) == 1 {
+					arrived <- struct{}{}
+					select {
+					case <-r.Context().Done():
+					case <-quit:
+					}
+					return
+				}
+				writeProto(w, r)
+			}))
+			t.Cleanup(func() { close(quit) })
+			p := startConnectProxy(t, false)
+
+			req, err := http.NewRequest(method, chatgptURL(server, "/"), strings.NewReader("payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- doRequest(p.url, req) }()
+			<-arrived
+			conns := pooledConns(t, p.url)
+			if len(conns) != 1 {
+				t.Fatalf("pooled conns = %d, want 1", len(conns))
+			}
+			_ = conns[0].cc.Close()
+			err = <-done
+			if method == http.MethodGet {
+				if err != nil || hits.Load() != 2 {
+					t.Fatalf("GET: err=%v hits=%d, want replayed once and succeeded", err, hits.Load())
+				}
+				return
+			}
+			if err == nil || hits.Load() != 1 {
+				t.Fatalf("POST: err=%v hits=%d, want the forced close returned and no resend", err, hits.Load())
+			}
+		})
 	}
 }

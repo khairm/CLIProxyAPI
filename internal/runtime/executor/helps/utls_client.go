@@ -152,12 +152,24 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			body.Close()
 			return nil, err
 		}
+		release := conn.use(req.Context())
 		readAtStart := conn.read.Load()
 		resp, err := conn.cc.RoundTrip(attempt)
 		if err == nil {
+			if resp.Body == http.NoBody {
+				release()
+				return resp, nil
+			}
+			tracked := &utlsResponseBody{ReadCloser: resp.Body, ctx: req.Context(), pool: t.pool, conn: conn, release: release}
+			tracked.lastRead.Store(conn.read.Load())
+			resp.Body = tracked
 			return resp, nil
 		}
+		release()
 		body.Close()
+		if conn.dead.Load() {
+			t.pool.MarkDead(conn.cc)
+		}
 		if err.Error() == errTextConnNotEstablished {
 			// x/net leaves a conn that died before its first stream reservable; drop it so the next request redials.
 			t.pool.MarkDead(conn.cc)
@@ -218,6 +230,7 @@ const (
 	errTextConnUnusable       = "http2: client conn not usable"
 	errTextConnGotGoAway      = "http2: Transport received Server's graceful shutdown GOAWAY"
 	errTextConnNotEstablished = "http2: client conn could not be established"
+	errTextConnForceClosed    = "http2: client connection force closed via ClientConn.Close"
 	errTextFromPeer           = "received from peer"
 )
 
@@ -233,11 +246,12 @@ func serverDidNotProcess(err error) bool {
 }
 
 // mayHaveBeenProcessed reports a failure that is often transient but leaves unknown whether the
-// server acted on the request: an abrupt close before the response, or a PROTOCOL_ERROR reset
-// sent by the server. A PROTOCOL_ERROR raised locally, such as on a malformed response, means
-// the server already answered, so it is not one.
+// server acted on the request: an abrupt close before the response (x/net reports it to the other
+// streams on that conn as a forced close), or a PROTOCOL_ERROR reset sent by the server. A
+// PROTOCOL_ERROR raised locally, such as on a malformed response, means the server already
+// answered, so it is not one.
 func mayHaveBeenProcessed(err error) bool {
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || err.Error() == errTextConnForceClosed {
 		return true
 	}
 	var se http2.StreamError
@@ -315,22 +329,92 @@ type utlsConnPool struct {
 	dialing map[string]*utlsDial
 }
 
-// utlsPooledConn is a shared connection plus a count of the bytes it has received,
-// which tells a silent (dead) tunnel apart from a slow but healthy one.
+// utlsPooledConn is a shared connection plus a count of the bytes it has received, which tells
+// a silent (dead) tunnel apart from a slow but healthy one, and the requests still using it.
 type utlsPooledConn struct {
-	cc   *http2.ClientConn
-	read atomic.Uint64
+	cc        *http2.ClientConn
+	read      atomic.Uint64
+	dead      atomic.Bool  // its read loop stopped, so it can never carry another request
+	live      atomic.Int32 // requests using it whose contexts have not ended
+	retired   atomic.Bool
+	closeOnce sync.Once
 }
+
+// use counts one request on conn until the returned release runs or its context ends. Closing
+// a retired conn waits for those requests only, never for a stuck write.
+func (c *utlsPooledConn) use(ctx context.Context) (release func()) {
+	c.live.Add(1)
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			if c.live.Add(-1) == 0 && c.retired.Load() {
+				c.close()
+			}
+		})
+	}
+	stop := context.AfterFunc(ctx, done)
+	return func() { stop(); done() }
+}
+
+func (c *utlsPooledConn) retire() {
+	c.retired.Store(true)
+	if c.live.Load() == 0 {
+		c.close()
+	}
+}
+
+// close drops the socket at once; Shutdown would wait behind a writer stuck on a full send buffer.
+func (c *utlsPooledConn) close() { c.closeOnce.Do(func() { _ = c.cc.Close() }) }
 
 type countingConn struct {
 	net.Conn
-	read *atomic.Uint64
+	conn *utlsPooledConn
 }
 
 func (c countingConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.read.Add(uint64(n))
+	c.conn.read.Add(uint64(n))
+	if err != nil {
+		c.conn.dead.Store(true)
+	}
 	return n, err
+}
+
+// utlsResponseBody releases its connection when the body is done. A body that ends by its
+// context with nothing received on the connection since the last read retires it as silent.
+type utlsResponseBody struct {
+	io.ReadCloser
+	ctx      context.Context
+	pool     *utlsConnPool
+	conn     *utlsPooledConn
+	release  func()
+	lastRead atomic.Uint64
+	once     sync.Once
+}
+
+func (b *utlsResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.finish(err == io.EOF)
+	} else {
+		b.lastRead.Store(b.conn.read.Load())
+	}
+	return n, err
+}
+
+func (b *utlsResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.finish(false)
+	return err
+}
+
+func (b *utlsResponseBody) finish(complete bool) {
+	b.once.Do(func() {
+		b.release()
+		if !complete && b.ctx.Err() != nil {
+			b.pool.dropIfSilent(b.conn, b.lastRead.Load())
+		}
+	})
 }
 
 type utlsDial struct {
@@ -356,6 +440,7 @@ func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledCon
 			return nil, err
 		}
 		p.mu.Lock()
+		p.dropDeadLocked(addr)
 		for _, conn := range p.conns[addr] {
 			if conn.cc.ReserveNewRequest() {
 				p.mu.Unlock()
@@ -384,6 +469,14 @@ func (p *utlsConnPool) reserve(ctx context.Context, addr string) (*utlsPooledCon
 	}
 }
 
+func (p *utlsConnPool) dropDeadLocked(addr string) {
+	if list := slices.DeleteFunc(p.conns[addr], func(conn *utlsPooledConn) bool { return conn.dead.Load() }); len(list) == 0 {
+		delete(p.conns, addr)
+	} else {
+		p.conns[addr] = list
+	}
+}
+
 func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -399,16 +492,16 @@ func (p *utlsConnPool) MarkDead(cc *http2.ClientConn) {
 	}
 }
 
-// dropIfSilent retires conn when a request sent on it ended with its context and the connection
+// dropIfSilent retires conn when a request on it ended with its context and the connection
 // received nothing at all meanwhile: the tunnel is dead, so new requests must dial a fresh one.
-// A quick cancel on a quiet but healthy connection therefore costs one redial.
-// Shutdown lets any other streams on it finish, then closes it.
-func (p *utlsConnPool) dropIfSilent(conn *utlsPooledConn, readAtStart uint64) {
-	if conn.read.Load() != readAtStart {
+// A quick cancel on a quiet but healthy connection therefore costs one redial. The conn closes
+// once no request whose context is still live uses it.
+func (p *utlsConnPool) dropIfSilent(conn *utlsPooledConn, readSince uint64) {
+	if conn.read.Load() != readSince {
 		return
 	}
 	p.MarkDead(conn.cc)
-	go func() { _ = conn.cc.Shutdown(context.Background()) }()
+	conn.retire()
 }
 
 // dial runs detached from any one request, so a cancelled first caller does not fail the others.
@@ -418,7 +511,7 @@ func (p *utlsConnPool) dial(d *utlsDial, addr string) {
 	conn, err := p.dialTLS(ctx, addr)
 	if err == nil {
 		pooled := &utlsPooledConn{}
-		if pooled.cc, err = p.h2.NewClientConn(countingConn{Conn: conn, read: &pooled.read}); err != nil {
+		if pooled.cc, err = p.h2.NewClientConn(countingConn{Conn: conn, conn: pooled}); err != nil {
 			_ = conn.Close()
 		} else {
 			d.conn = pooled
